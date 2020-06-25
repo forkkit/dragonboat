@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build !dragonboat_slowtest
-// +build !dragonboat_errorinjectiontest
-
 package dragonboat
 
 import (
@@ -23,7 +20,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/lni/dragonboat/v3/client"
 	"github.com/lni/dragonboat/v3/config"
@@ -31,10 +27,6 @@ import (
 	pb "github.com/lni/dragonboat/v3/raftpb"
 	sm "github.com/lni/dragonboat/v3/statemachine"
 	"github.com/lni/goutils/random"
-)
-
-const (
-	testTickInMillisecond uint64 = 50
 )
 
 func TestPendingLeaderTransferCanBeCreated(t *testing.T) {
@@ -73,7 +65,9 @@ func TestCanGetExitingLeaderTransferRequest(t *testing.T) {
 	if ok {
 		t.Errorf("unexpectedly returned request")
 	}
-	p.request(1)
+	if err := p.request(1); err != nil {
+		t.Errorf("failed to request leadership transfer %v", err)
+	}
 	v, ok := p.get()
 	if !ok || v != 1 {
 		t.Errorf("failed to get request")
@@ -95,12 +89,12 @@ func TestRequestStatePanicWhenNotReadyForRead(t *testing.T) {
 	}
 	r1 := &RequestState{}
 	r2 := &RequestState{node: &node{}}
-	r3 := &RequestState{node: &node{}}
+	r3 := &RequestState{node: &node{initializedC: make(chan struct{})}}
 	r3.node.setInitialized()
 	fn(r1)
 	fn(r2)
 	fn(r3)
-	r4 := &RequestState{node: &node{}}
+	r4 := &RequestState{node: &node{initializedC: make(chan struct{})}}
 	r4.node.setInitialized()
 	r4.readyToRead.set()
 	r4.mustBeReadyForLocalRead()
@@ -108,7 +102,7 @@ func TestRequestStatePanicWhenNotReadyForRead(t *testing.T) {
 
 func TestPendingSnapshotCanBeCreatedAndClosed(t *testing.T) {
 	snapshotC := make(chan<- rsm.SSRequest, 1)
-	ps := newPendingSnapshot(snapshotC, testTickInMillisecond)
+	ps := newPendingSnapshot(snapshotC)
 	if len(ps.snapshotC) != 0 {
 		t.Errorf("snapshotC not empty")
 	}
@@ -124,7 +118,7 @@ func TestPendingSnapshotCanBeCreatedAndClosed(t *testing.T) {
 		t.Errorf("pending not cleared")
 	}
 	select {
-	case v := <-pending.CompletedC:
+	case v := <-pending.ResultC():
 		if !v.Terminated() {
 			t.Errorf("unexpected code")
 		}
@@ -135,8 +129,8 @@ func TestPendingSnapshotCanBeCreatedAndClosed(t *testing.T) {
 
 func TestPendingSnapshotCanBeRequested(t *testing.T) {
 	snapshotC := make(chan rsm.SSRequest, 1)
-	ps := newPendingSnapshot(snapshotC, testTickInMillisecond)
-	ss, err := ps.request(rsm.UserRequestedSnapshot, "", false, 0, time.Second)
+	ps := newPendingSnapshot(snapshotC)
+	ss, err := ps.request(rsm.UserRequested, "", false, 0, 10)
 	if err != nil {
 		t.Errorf("failed to request snapshot")
 	}
@@ -158,8 +152,8 @@ func TestPendingSnapshotCanBeRequested(t *testing.T) {
 
 func TestTooSmallSnapshotTimeoutIsRejected(t *testing.T) {
 	snapshotC := make(chan<- rsm.SSRequest, 1)
-	ps := newPendingSnapshot(snapshotC, 50)
-	ss, err := ps.request(rsm.UserRequestedSnapshot, "", false, 0, 49*time.Millisecond)
+	ps := newPendingSnapshot(snapshotC)
+	ss, err := ps.request(rsm.UserRequested, "", false, 0, 0)
 	if err != ErrTimeoutTooSmall {
 		t.Errorf("request not rejected")
 	}
@@ -170,15 +164,15 @@ func TestTooSmallSnapshotTimeoutIsRejected(t *testing.T) {
 
 func TestMultiplePendingSnapshotIsNotAllowed(t *testing.T) {
 	snapshotC := make(chan<- rsm.SSRequest, 1)
-	ps := newPendingSnapshot(snapshotC, testTickInMillisecond)
-	ss, err := ps.request(rsm.UserRequestedSnapshot, "", false, 0, time.Second)
+	ps := newPendingSnapshot(snapshotC)
+	ss, err := ps.request(rsm.UserRequested, "", false, 0, 100)
 	if err != nil {
 		t.Errorf("failed to request snapshot")
 	}
 	if ss == nil {
 		t.Errorf("nil ss returned")
 	}
-	ss, err = ps.request(rsm.UserRequestedSnapshot, "", false, 0, time.Second)
+	ss, err = ps.request(rsm.UserRequested, "", false, 0, 100)
 	if err != ErrPendingSnapshotRequestExist {
 		t.Errorf("request not rejected")
 	}
@@ -189,8 +183,8 @@ func TestMultiplePendingSnapshotIsNotAllowed(t *testing.T) {
 
 func TestPendingSnapshotCanBeGCed(t *testing.T) {
 	snapshotC := make(chan rsm.SSRequest, 1)
-	ps := newPendingSnapshot(snapshotC, testTickInMillisecond)
-	ss, err := ps.request(rsm.UserRequestedSnapshot, "", false, 0, time.Second)
+	ps := newPendingSnapshot(snapshotC)
+	ss, err := ps.request(rsm.UserRequested, "", false, 0, 20)
 	if err != nil {
 		t.Errorf("failed to request snapshot")
 	}
@@ -213,7 +207,7 @@ func TestPendingSnapshotCanBeGCed(t *testing.T) {
 		t.Errorf("pending is not cleared")
 	}
 	select {
-	case v := <-ss.CompletedC:
+	case v := <-ss.ResultC():
 		if !v.Timeout() {
 			t.Errorf("not timeout")
 		}
@@ -224,17 +218,17 @@ func TestPendingSnapshotCanBeGCed(t *testing.T) {
 
 func TestPendingSnapshotCanBeApplied(t *testing.T) {
 	snapshotC := make(chan rsm.SSRequest, 1)
-	ps := newPendingSnapshot(snapshotC, testTickInMillisecond)
-	ss, err := ps.request(rsm.UserRequestedSnapshot, "", false, 0, time.Second)
+	ps := newPendingSnapshot(snapshotC)
+	ss, err := ps.request(rsm.UserRequested, "", false, 0, 100)
 	if err != nil {
 		t.Errorf("failed to request snapshot")
 	}
 	if ss == nil {
 		t.Errorf("nil ss returned")
 	}
-	ps.apply(ss.key, false, 123)
+	ps.apply(ss.key, false, false, 123)
 	select {
-	case v := <-ss.CompletedC:
+	case v := <-ss.ResultC():
 		if v.SnapshotIndex() != 123 {
 			t.Errorf("index value not returned")
 		}
@@ -248,17 +242,17 @@ func TestPendingSnapshotCanBeApplied(t *testing.T) {
 
 func TestPendingSnapshotCanBeIgnored(t *testing.T) {
 	snapshotC := make(chan rsm.SSRequest, 1)
-	ps := newPendingSnapshot(snapshotC, testTickInMillisecond)
-	ss, err := ps.request(rsm.UserRequestedSnapshot, "", false, 0, time.Second)
+	ps := newPendingSnapshot(snapshotC)
+	ss, err := ps.request(rsm.UserRequested, "", false, 0, 100)
 	if err != nil {
 		t.Errorf("failed to request snapshot")
 	}
 	if ss == nil {
 		t.Errorf("nil ss returned")
 	}
-	ps.apply(ss.key, true, 123)
+	ps.apply(ss.key, true, false, 123)
 	select {
-	case v := <-ss.CompletedC:
+	case v := <-ss.ResultC():
 		if v.SnapshotIndex() != 0 {
 			t.Errorf("index value incorrectly set")
 		}
@@ -272,8 +266,8 @@ func TestPendingSnapshotCanBeIgnored(t *testing.T) {
 
 func TestPendingSnapshotIsIdentifiedByTheKey(t *testing.T) {
 	snapshotC := make(chan rsm.SSRequest, 1)
-	ps := newPendingSnapshot(snapshotC, testTickInMillisecond)
-	ss, err := ps.request(rsm.UserRequestedSnapshot, "", false, 0, time.Second)
+	ps := newPendingSnapshot(snapshotC)
+	ss, err := ps.request(rsm.UserRequested, "", false, 0, 100)
 	if err != nil {
 		t.Errorf("failed to request snapshot")
 	}
@@ -283,12 +277,12 @@ func TestPendingSnapshotIsIdentifiedByTheKey(t *testing.T) {
 	if ps.pending == nil {
 		t.Errorf("pending not set")
 	}
-	ps.apply(ss.key+1, false, 123)
+	ps.apply(ss.key+1, false, false, 123)
 	if ps.pending == nil {
 		t.Errorf("pending unexpectedly cleared")
 	}
 	select {
-	case <-ss.CompletedC:
+	case <-ss.ResultC():
 		t.Fatalf("unexpectedly notified")
 	default:
 	}
@@ -296,9 +290,9 @@ func TestPendingSnapshotIsIdentifiedByTheKey(t *testing.T) {
 
 func TestSnapshotCanNotBeRequestedAfterClose(t *testing.T) {
 	snapshotC := make(chan rsm.SSRequest, 1)
-	ps := newPendingSnapshot(snapshotC, testTickInMillisecond)
+	ps := newPendingSnapshot(snapshotC)
 	ps.close()
-	ss, err := ps.request(rsm.UserRequestedSnapshot, "", false, 0, time.Second)
+	ss, err := ps.request(rsm.UserRequested, "", false, 0, 100)
 	if err != ErrClusterClosed {
 		t.Errorf("not report as closed")
 	}
@@ -309,8 +303,8 @@ func TestSnapshotCanNotBeRequestedAfterClose(t *testing.T) {
 
 func TestCompactionOverheadDetailsIsRecorded(t *testing.T) {
 	snapshotC := make(chan rsm.SSRequest, 1)
-	ps := newPendingSnapshot(snapshotC, testTickInMillisecond)
-	_, err := ps.request(rsm.UserRequestedSnapshot, "", true, 123, time.Second)
+	ps := newPendingSnapshot(snapshotC)
+	_, err := ps.request(rsm.UserRequested, "", true, 123, 100)
 	if err != nil {
 		t.Errorf("failed to request snapshot")
 	}
@@ -324,9 +318,10 @@ func TestCompactionOverheadDetailsIsRecorded(t *testing.T) {
 	}
 }
 
-func getPendingConfigChange() (*pendingConfigChange, chan configChangeRequest) {
+func getPendingConfigChange(notifyCommit bool) (*pendingConfigChange,
+	chan configChangeRequest) {
 	c := make(chan configChangeRequest, 1)
-	return newPendingConfigChange(c, testTickInMillisecond), c
+	return newPendingConfigChange(c, notifyCommit), c
 }
 
 func TestRequestStateRelease(t *testing.T) {
@@ -361,7 +356,7 @@ func TestRequestStateSetToReadyToReleaseOnceNotified(t *testing.T) {
 	}
 }
 
-func TestReleasingNotReadyRequestStateWillPanic(t *testing.T) {
+func TestReleasingNotReadyRequestStateWillBeIgnored(t *testing.T) {
 	rs := RequestState{
 		key:         100,
 		clientID:    200,
@@ -371,16 +366,14 @@ func TestReleasingNotReadyRequestStateWillPanic(t *testing.T) {
 		node:        &node{},
 		pool:        &sync.Pool{},
 	}
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatalf("no panic")
-		}
-	}()
 	rs.Release()
+	if rs.key != 100 || rs.deadline != 500 {
+		t.Fatalf("unexpectedly released")
+	}
 }
 
 func TestPendingConfigChangeCanBeCreatedAndClosed(t *testing.T) {
-	pcc, c := getPendingConfigChange()
+	pcc, c := getPendingConfigChange(false)
 	select {
 	case <-c:
 		t.Errorf("unexpected content in confChangeC")
@@ -398,9 +391,9 @@ func TestPendingConfigChangeCanBeCreatedAndClosed(t *testing.T) {
 }
 
 func TestConfigChangeCanBeRequested(t *testing.T) {
-	pcc, c := getPendingConfigChange()
+	pcc, c := getPendingConfigChange(false)
 	var cc pb.ConfigChange
-	rs, err := pcc.request(cc, time.Second)
+	rs, err := pcc.request(cc, 100)
 	if err != nil {
 		t.Errorf("RequestConfigChange failed: %v", err)
 	}
@@ -413,7 +406,7 @@ func TestConfigChangeCanBeRequested(t *testing.T) {
 	if len(c) != 1 {
 		t.Errorf("len(c) = %d, want 1", len(c))
 	}
-	_, err = pcc.request(cc, time.Second)
+	_, err = pcc.request(cc, 100)
 	if err == nil {
 		t.Errorf("not expect to be success")
 	}
@@ -422,7 +415,7 @@ func TestConfigChangeCanBeRequested(t *testing.T) {
 	}
 	pcc.close()
 	select {
-	case v := <-rs.CompletedC:
+	case v := <-rs.ResultC():
 		if !v.Terminated() {
 			t.Errorf("returned %v, want %d", v, requestTerminated)
 		}
@@ -432,11 +425,10 @@ func TestConfigChangeCanBeRequested(t *testing.T) {
 }
 
 func TestConfigChangeCanExpire(t *testing.T) {
-	pcc, _ := getPendingConfigChange()
+	pcc, _ := getPendingConfigChange(false)
 	var cc pb.ConfigChange
-	timeout := time.Duration(1000 * time.Millisecond)
-	tickCount := uint64(1000 / testTickInMillisecond)
-	rs, err := pcc.request(cc, timeout)
+	tickCount := uint64(100)
+	rs, err := pcc.request(cc, tickCount)
 	if err != nil {
 		t.Errorf("RequestConfigChange failed: %v", err)
 	}
@@ -445,7 +437,7 @@ func TestConfigChangeCanExpire(t *testing.T) {
 		pcc.gc()
 	}
 	select {
-	case <-rs.CompletedC:
+	case <-rs.ResultC():
 		t.Errorf("not suppose to has anything at this stage")
 	default:
 	}
@@ -454,7 +446,7 @@ func TestConfigChangeCanExpire(t *testing.T) {
 		pcc.gc()
 	}
 	select {
-	case v, ok := <-rs.CompletedC:
+	case v, ok := <-rs.ResultC():
 		if ok {
 			if !v.Timeout() {
 				t.Errorf("v: %v, expect %d", v, requestTimeout)
@@ -465,21 +457,36 @@ func TestConfigChangeCanExpire(t *testing.T) {
 	}
 }
 
-func TestCompletedConfigChangeRequestCanBeNotified(t *testing.T) {
-	pcc, _ := getPendingConfigChange()
+func TestCommittedConfigChangeRequestCanBeNotified(t *testing.T) {
+	pcc, _ := getPendingConfigChange(true)
 	var cc pb.ConfigChange
-	rs, err := pcc.request(cc, time.Second)
+	rs, err := pcc.request(cc, 100)
+	if err != nil {
+		t.Errorf("RequestConfigChange failed: %v", err)
+	}
+	pcc.committed(rs.key)
+	select {
+	case <-rs.committedC:
+	default:
+		t.Fatalf("committedC not signalled")
+	}
+}
+
+func TestCompletedConfigChangeRequestCanBeNotified(t *testing.T) {
+	pcc, _ := getPendingConfigChange(false)
+	var cc pb.ConfigChange
+	rs, err := pcc.request(cc, 100)
 	if err != nil {
 		t.Errorf("RequestConfigChange failed: %v", err)
 	}
 	select {
-	case <-rs.CompletedC:
+	case <-rs.ResultC():
 		t.Errorf("not suppose to return anything yet")
 	default:
 	}
 	pcc.apply(rs.key, false)
 	select {
-	case v := <-rs.CompletedC:
+	case v := <-rs.ResultC():
 		if !v.Completed() {
 			t.Errorf("returned %v, want %d", v, requestCompleted)
 		}
@@ -492,20 +499,20 @@ func TestCompletedConfigChangeRequestCanBeNotified(t *testing.T) {
 }
 
 func TestConfigChangeRequestCanNotBeNotifiedWithDifferentKey(t *testing.T) {
-	pcc, _ := getPendingConfigChange()
+	pcc, _ := getPendingConfigChange(false)
 	var cc pb.ConfigChange
-	rs, err := pcc.request(cc, time.Second)
+	rs, err := pcc.request(cc, 100)
 	if err != nil {
 		t.Errorf("RequestConfigChange failed: %v", err)
 	}
 	select {
-	case <-rs.CompletedC:
+	case <-rs.ResultC():
 		t.Errorf("not suppose to return anything yet")
 	default:
 	}
 	pcc.apply(rs.key+1, false)
 	select {
-	case <-rs.CompletedC:
+	case <-rs.ResultC():
 		t.Errorf("unexpectedly notified")
 	default:
 	}
@@ -515,20 +522,20 @@ func TestConfigChangeRequestCanNotBeNotifiedWithDifferentKey(t *testing.T) {
 }
 
 func TestConfigChangeCanBeDropped(t *testing.T) {
-	pcc, _ := getPendingConfigChange()
+	pcc, _ := getPendingConfigChange(false)
 	var cc pb.ConfigChange
-	rs, err := pcc.request(cc, time.Second)
+	rs, err := pcc.request(cc, 100)
 	if err != nil {
 		t.Errorf("RequestConfigChange failed: %v", err)
 	}
 	select {
-	case <-rs.CompletedC:
+	case <-rs.ResultC():
 		t.Errorf("not suppose to return anything yet")
 	default:
 	}
 	pcc.dropped(rs.key)
 	select {
-	case v := <-rs.CompletedC:
+	case v := <-rs.ResultC():
 		if !v.Dropped() {
 			t.Errorf("Dropped() is false")
 		}
@@ -541,20 +548,20 @@ func TestConfigChangeCanBeDropped(t *testing.T) {
 }
 
 func TestConfigChangeWithDifferentKeyWillNotBeDropped(t *testing.T) {
-	pcc, _ := getPendingConfigChange()
+	pcc, _ := getPendingConfigChange(false)
 	var cc pb.ConfigChange
-	rs, err := pcc.request(cc, time.Second)
+	rs, err := pcc.request(cc, 100)
 	if err != nil {
 		t.Errorf("RequestConfigChange failed: %v", err)
 	}
 	select {
-	case <-rs.CompletedC:
+	case <-rs.ResultC():
 		t.Errorf("not suppose to return anything yet")
 	default:
 	}
 	pcc.dropped(rs.key + 1)
 	select {
-	case <-rs.CompletedC:
+	case <-rs.ResultC():
 		t.Errorf("CompletedC unexpectedly set")
 	default:
 	}
@@ -567,18 +574,20 @@ func TestConfigChangeWithDifferentKeyWillNotBeDropped(t *testing.T) {
 // pending proposal
 //
 
-func getPendingProposal() (*pendingProposal, *entryQueue) {
+func getPendingProposal(notifyCommit bool) (*pendingProposal, *entryQueue) {
 	c := newEntryQueue(5, 0)
 	p := &sync.Pool{}
 	p.New = func() interface{} {
 		obj := &RequestState{}
 		obj.pool = p
 		obj.CompletedC = make(chan RequestResult, 1)
+		if notifyCommit {
+			obj.committedC = make(chan RequestResult, 1)
+		}
 		return obj
 	}
 	cfg := config.Config{ClusterID: 100, NodeID: 120}
-	return newPendingProposal(cfg,
-		p, c, "nodehost:12345", testTickInMillisecond), c
+	return newPendingProposal(cfg, notifyCommit, p, c, "nodehost:12345"), c
 }
 
 func getBlankTestSession() *client.Session {
@@ -586,7 +595,7 @@ func getBlankTestSession() *client.Session {
 }
 
 func TestPendingProposalCanBeCreatedAndClosed(t *testing.T) {
-	pp, c := getPendingProposal()
+	pp, c := getPendingProposal(false)
 	if len(c.get(false)) > 0 {
 		t.Errorf("unexpected item in entry queue")
 	}
@@ -633,8 +642,8 @@ func TestLargeProposalCanBeProposed(t *testing.T) {
 }*/
 
 func TestProposalCanBeProposed(t *testing.T) {
-	pp, c := getPendingProposal()
-	rs, err := pp.propose(getBlankTestSession(), []byte("test data"), nil, time.Second)
+	pp, c := getPendingProposal(false)
+	rs, err := pp.propose(getBlankTestSession(), []byte("test data"), 100)
 	if err != nil {
 		t.Errorf("failed to make proposal, %v", err)
 	}
@@ -642,7 +651,7 @@ func TestProposalCanBeProposed(t *testing.T) {
 		t.Errorf("len(pending)=%d, want 1", countPendingProposal(pp))
 	}
 	select {
-	case <-rs.CompletedC:
+	case <-rs.ResultC():
 		t.Errorf("not suppose to have anything completed")
 	default:
 	}
@@ -652,7 +661,7 @@ func TestProposalCanBeProposed(t *testing.T) {
 	}
 	pp.close()
 	select {
-	case v := <-rs.CompletedC:
+	case v := <-rs.ResultC():
 		if !v.Terminated() {
 			t.Errorf("get %v, want %d", v, requestTerminated)
 		}
@@ -662,23 +671,23 @@ func TestProposalCanBeProposed(t *testing.T) {
 }
 
 func TestProposeOnClosedPendingProposalReturnError(t *testing.T) {
-	pp, _ := getPendingProposal()
+	pp, _ := getPendingProposal(false)
 	pp.close()
-	_, err := pp.propose(getBlankTestSession(), []byte("test data"), nil, time.Second)
+	_, err := pp.propose(getBlankTestSession(), []byte("test data"), 100)
 	if err != ErrClusterClosed {
 		t.Errorf("unexpected err %v", err)
 	}
 }
 
 func TestProposalCanBeCompleted(t *testing.T) {
-	pp, _ := getPendingProposal()
-	rs, err := pp.propose(getBlankTestSession(), []byte("test data"), nil, time.Second)
+	pp, _ := getPendingProposal(false)
+	rs, err := pp.propose(getBlankTestSession(), []byte("test data"), 100)
 	if err != nil {
 		t.Errorf("failed to make proposal, %v", err)
 	}
 	pp.applied(rs.clientID, rs.seriesID, rs.key+1, sm.Result{}, false)
 	select {
-	case <-rs.CompletedC:
+	case <-rs.ResultC():
 		t.Errorf("unexpected applied proposal with invalid client ID")
 	default:
 	}
@@ -687,7 +696,7 @@ func TestProposalCanBeCompleted(t *testing.T) {
 	}
 	pp.applied(rs.clientID, rs.seriesID, rs.key, sm.Result{}, false)
 	select {
-	case v := <-rs.CompletedC:
+	case v := <-rs.ResultC():
 		if !v.Completed() {
 			t.Errorf("get %v, want %d", v, requestCompleted)
 		}
@@ -700,14 +709,14 @@ func TestProposalCanBeCompleted(t *testing.T) {
 }
 
 func TestProposalCanBeDropped(t *testing.T) {
-	pp, _ := getPendingProposal()
-	rs, err := pp.propose(getBlankTestSession(), []byte("test data"), nil, time.Second)
+	pp, _ := getPendingProposal(false)
+	rs, err := pp.propose(getBlankTestSession(), []byte("test data"), 100)
 	if err != nil {
 		t.Errorf("failed to make proposal, %v", err)
 	}
 	pp.dropped(rs.clientID, rs.seriesID, rs.key)
 	select {
-	case v := <-rs.CompletedC:
+	case v := <-rs.ResultC():
 		if !v.Dropped() {
 			t.Errorf("not dropped")
 		}
@@ -722,8 +731,8 @@ func TestProposalCanBeDropped(t *testing.T) {
 }
 
 func TestProposalResultCanBeObtainedByCaller(t *testing.T) {
-	pp, _ := getPendingProposal()
-	rs, err := pp.propose(getBlankTestSession(), []byte("test data"), nil, time.Second)
+	pp, _ := getPendingProposal(false)
+	rs, err := pp.propose(getBlankTestSession(), []byte("test data"), 100)
 	if err != nil {
 		t.Errorf("failed to make proposal, %v", err)
 	}
@@ -734,7 +743,7 @@ func TestProposalResultCanBeObtainedByCaller(t *testing.T) {
 	rand.Read(result.Data)
 	pp.applied(rs.clientID, rs.seriesID, rs.key, result, false)
 	select {
-	case v := <-rs.CompletedC:
+	case v := <-rs.ResultC():
 		if !v.Completed() {
 			t.Errorf("get %v, want %d", v, requestCompleted)
 		}
@@ -748,14 +757,14 @@ func TestProposalResultCanBeObtainedByCaller(t *testing.T) {
 }
 
 func TestClientIDIsCheckedWhenApplyingProposal(t *testing.T) {
-	pp, _ := getPendingProposal()
-	rs, err := pp.propose(getBlankTestSession(), []byte("test data"), nil, time.Second)
+	pp, _ := getPendingProposal(false)
+	rs, err := pp.propose(getBlankTestSession(), []byte("test data"), 100)
 	if err != nil {
 		t.Errorf("failed to make proposal, %v", err)
 	}
 	pp.applied(rs.clientID+1, rs.seriesID, rs.key, sm.Result{}, false)
 	select {
-	case <-rs.CompletedC:
+	case <-rs.ResultC():
 		t.Errorf("unexpected applied proposal with invalid client ID")
 	default:
 	}
@@ -764,7 +773,7 @@ func TestClientIDIsCheckedWhenApplyingProposal(t *testing.T) {
 	}
 	pp.applied(rs.clientID, rs.seriesID, rs.key, sm.Result{}, false)
 	select {
-	case v := <-rs.CompletedC:
+	case v := <-rs.ResultC():
 		if !v.Completed() {
 			t.Errorf("get %v, want %d", v, requestCompleted)
 		}
@@ -777,14 +786,14 @@ func TestClientIDIsCheckedWhenApplyingProposal(t *testing.T) {
 }
 
 func TestSeriesIDIsCheckedWhenApplyingProposal(t *testing.T) {
-	pp, _ := getPendingProposal()
-	rs, err := pp.propose(getBlankTestSession(), []byte("test data"), nil, time.Second)
+	pp, _ := getPendingProposal(false)
+	rs, err := pp.propose(getBlankTestSession(), []byte("test data"), 100)
 	if err != nil {
 		t.Errorf("failed to make proposal, %v", err)
 	}
 	pp.applied(rs.clientID, rs.seriesID+1, rs.key, sm.Result{}, false)
 	select {
-	case <-rs.CompletedC:
+	case <-rs.ResultC():
 		t.Errorf("unexpected applied proposal with invalid client ID")
 	default:
 	}
@@ -793,7 +802,36 @@ func TestSeriesIDIsCheckedWhenApplyingProposal(t *testing.T) {
 	}
 	pp.applied(rs.clientID, rs.seriesID, rs.key, sm.Result{}, false)
 	select {
-	case v := <-rs.CompletedC:
+	case v := <-rs.ResultC():
+		if !v.Completed() {
+			t.Errorf("get %v, want %d", v, requestCompleted)
+		}
+	default:
+		t.Errorf("expect to get complete signal")
+	}
+	if countPendingProposal(pp) != 0 {
+		t.Errorf("pending is not empty")
+	}
+}
+
+func TestProposalCanBeCommitted(t *testing.T) {
+	pp, _ := getPendingProposal(true)
+	rs, err := pp.propose(getBlankTestSession(), []byte("test data"), 100)
+	if err != nil {
+		t.Errorf("failed to make proposal, %v", err)
+	}
+	pp.committed(rs.clientID, rs.seriesID, rs.key)
+	select {
+	case <-rs.committedC:
+	default:
+		t.Errorf("not committed")
+	}
+	if countPendingProposal(pp) == 0 {
+		t.Errorf("pending is empty")
+	}
+	pp.applied(rs.clientID, rs.seriesID, rs.key, sm.Result{}, false)
+	select {
+	case v := <-rs.AppliedC():
 		if !v.Completed() {
 			t.Errorf("get %v, want %d", v, requestCompleted)
 		}
@@ -806,19 +844,18 @@ func TestSeriesIDIsCheckedWhenApplyingProposal(t *testing.T) {
 }
 
 func TestProposalCanBeExpired(t *testing.T) {
-	pp, _ := getPendingProposal()
-	timeout := time.Duration(1000 * time.Millisecond)
-	rs, err := pp.propose(getBlankTestSession(), []byte("test data"), nil, timeout)
+	pp, _ := getPendingProposal(false)
+	tickCount := uint64(100)
+	rs, err := pp.propose(getBlankTestSession(), []byte("test data"), tickCount)
 	if err != nil {
 		t.Errorf("failed to make proposal, %v", err)
 	}
-	tickCount := uint64(1000 / testTickInMillisecond)
 	for i := uint64(0); i < tickCount; i++ {
 		pp.tick()
 		pp.gc()
 	}
 	select {
-	case <-rs.CompletedC:
+	case <-rs.ResultC():
 		t.Errorf("not suppose to return anything")
 	default:
 	}
@@ -827,7 +864,7 @@ func TestProposalCanBeExpired(t *testing.T) {
 		pp.gc()
 	}
 	select {
-	case v := <-rs.CompletedC:
+	case v := <-rs.ResultC():
 		if !v.Timeout() {
 			t.Errorf("got %v, want %d", v, requestTimeout)
 		}
@@ -839,9 +876,9 @@ func TestProposalCanBeExpired(t *testing.T) {
 }
 
 func TestProposalErrorsAreReported(t *testing.T) {
-	pp, c := getPendingProposal()
+	pp, c := getPendingProposal(false)
 	for i := 0; i < 5; i++ {
-		_, err := pp.propose(getBlankTestSession(), []byte("test data"), nil, time.Second)
+		_, err := pp.propose(getBlankTestSession(), []byte("test data"), 100)
 		if err != nil {
 			t.Errorf("propose failed")
 		}
@@ -853,7 +890,7 @@ func TestProposalErrorsAreReported(t *testing.T) {
 		cq = c.right
 	}
 	sz := len(cq)
-	_, err := pp.propose(getBlankTestSession(), []byte("test data"), nil, time.Second)
+	_, err := pp.propose(getBlankTestSession(), []byte("test data"), 100)
 	if err != ErrSystemBusy {
 		t.Errorf("suppose to return ErrSystemBusy")
 	}
@@ -868,15 +905,15 @@ func TestProposalErrorsAreReported(t *testing.T) {
 }
 
 func TestClosePendingProposalIgnoresStepEngineActivities(t *testing.T) {
-	pp, _ := getPendingProposal()
+	pp, _ := getPendingProposal(false)
 	session := &client.Session{
 		ClientID:    100,
 		SeriesID:    200,
 		RespondedTo: 199,
 	}
-	rs, _ := pp.propose(session, nil, nil, time.Duration(5*time.Second))
+	rs, _ := pp.propose(session, nil, 100)
 	select {
-	case <-rs.CompletedC:
+	case <-rs.ResultC():
 		t.Fatalf("completedC is already signalled")
 	default:
 	}
@@ -885,7 +922,7 @@ func TestClosePendingProposalIgnoresStepEngineActivities(t *testing.T) {
 	}
 	pp.applied(rs.clientID, rs.seriesID, rs.key, sm.Result{Value: 1}, false)
 	select {
-	case <-rs.CompletedC:
+	case <-rs.ResultC():
 		t.Fatalf("completedC unexpectedly signaled")
 	default:
 	}
@@ -900,7 +937,7 @@ func getPendingSCRead() (*pendingReadIndex, *readIndexQueue) {
 		obj.CompletedC = make(chan RequestResult, 1)
 		return obj
 	}
-	return newPendingReadIndex(p, q, testTickInMillisecond), q
+	return newPendingReadIndex(p, q), q
 }
 
 func TestPendingSCReadCanBeCreatedAndClosed(t *testing.T) {
@@ -916,12 +953,12 @@ func TestPendingSCReadCanBeCreatedAndClosed(t *testing.T) {
 
 func TestPendingSCReadCanRead(t *testing.T) {
 	pp, c := getPendingSCRead()
-	rs, err := pp.read(nil, time.Second)
+	rs, err := pp.read(100)
 	if err != nil {
 		t.Errorf("failed to do read")
 	}
 	select {
-	case <-rs.CompletedC:
+	case <-rs.ResultC():
 		t.Errorf("not suppose to return anything")
 	default:
 	}
@@ -937,12 +974,12 @@ func TestPendingSCReadCanRead(t *testing.T) {
 	if pp.requests.pendingSize() != 1 {
 		t.Errorf("req not recorded in temp")
 	}
-	if len(pp.pending) != 0 {
+	if len(pp.batches) != 0 {
 		t.Errorf("pending is expected to be empty")
 	}
 	pp.close()
 	select {
-	case v := <-rs.CompletedC:
+	case v := <-rs.ResultC():
 		if !v.Terminated() {
 			t.Errorf("got %v, want %d", v, requestTerminated)
 		}
@@ -953,17 +990,17 @@ func TestPendingSCReadCanRead(t *testing.T) {
 
 func TestPendingSCReadCanComplete(t *testing.T) {
 	pp, _ := getPendingSCRead()
-	rs, err := pp.read(nil, time.Second)
+	rs, err := pp.read(100)
 	if err != nil {
 		t.Errorf("failed to do read")
 	}
-	s := pp.peepNextCtx()
-	pp.addPendingRead(s, []*RequestState{rs})
+	s := pp.nextCtx()
+	pp.add(s, []*RequestState{rs})
 	readState := pb.ReadyToRead{Index: 500, SystemCtx: s}
-	pp.addReadyToRead([]pb.ReadyToRead{readState})
+	pp.addReady([]pb.ReadyToRead{readState})
 	pp.applied(499)
 	select {
-	case <-rs.CompletedC:
+	case <-rs.ResultC():
 		t.Errorf("not expected to be signaled")
 	default:
 	}
@@ -975,140 +1012,96 @@ func TestPendingSCReadCanComplete(t *testing.T) {
 		t.Errorf("ready not set")
 	}
 	select {
-	case v := <-rs.CompletedC:
+	case v := <-rs.ResultC():
 		if !v.Completed() {
 			t.Errorf("got %v, want %d", v, requestCompleted)
 		}
 	default:
 		t.Errorf("expect to complete")
 	}
-	if len(pp.mapping) != 0 {
+	if len(pp.batches) != 0 {
 		t.Errorf("leaking records")
-	}
-	if len(pp.batches) == 0 {
-		t.Errorf("batches is not suppose to be empty")
 	}
 }
 
 func TestPendingReadIndexCanBeDropped(t *testing.T) {
 	pp, _ := getPendingSCRead()
-	rs, err := pp.read(nil, time.Second)
+	rs, err := pp.read(100)
 	if err != nil {
 		t.Errorf("failed to do read")
 	}
-	s := pp.peepNextCtx()
-	pp.addPendingRead(s, []*RequestState{rs})
+	s := pp.nextCtx()
+	pp.add(s, []*RequestState{rs})
 	pp.dropped(s)
 	select {
-	case v := <-rs.CompletedC:
+	case v := <-rs.ResultC():
 		if !v.Dropped() {
 			t.Errorf("got %v, want %d", v, requestDropped)
 		}
 	default:
 		t.Errorf("expect to complete")
 	}
-	if len(pp.pending) > 0 || len(pp.batches) > 0 || len(pp.mapping) > 0 {
+	if len(pp.batches) > 0 {
 		t.Errorf("not cleared")
 	}
 }
 
+func testPendingSCReadCanExpire(t *testing.T, addReady bool) {
+	pp, _ := getPendingSCRead()
+	rs, err := pp.read(100)
+	if err != nil {
+		t.Errorf("failed to do read")
+	}
+	s := pp.nextCtx()
+	pp.add(s, []*RequestState{rs})
+	if addReady {
+		readState := pb.ReadyToRead{Index: 500, SystemCtx: s}
+		pp.addReady([]pb.ReadyToRead{readState})
+	}
+	tickToWait := 100 + defaultGCTick + 1
+	for i := uint64(0); i < tickToWait; i++ {
+		pp.tick()
+		pp.applied(499)
+	}
+	select {
+	case v := <-rs.ResultC():
+		if !v.Timeout() {
+			t.Errorf("got %v, want %d", v, requestTimeout)
+		}
+	default:
+		t.Errorf("expect to complete")
+	}
+	if len(pp.batches) != 0 {
+		t.Errorf("leaking records")
+	}
+}
+
 func TestPendingSCReadCanExpire(t *testing.T) {
+	testPendingSCReadCanExpire(t, true)
+}
+
+func TestPendingSCReadCanExpireWithoutCallingAddReady(t *testing.T) {
+	testPendingSCReadCanExpire(t, false)
+}
+
+func TestNonEmptyReadBatchIsNeverExpired(t *testing.T) {
 	pp, _ := getPendingSCRead()
-	timeout := time.Duration(1000 * time.Millisecond)
-	rs, err := pp.read(nil, timeout)
+	rs, err := pp.read(10000)
 	if err != nil {
 		t.Errorf("failed to do read")
 	}
-	s := pp.peepNextCtx()
-	pp.addPendingRead(s, []*RequestState{rs})
-	readState := pb.ReadyToRead{Index: 500, SystemCtx: s}
-	pp.addReadyToRead([]pb.ReadyToRead{readState})
-	tickToWait := 1000/testTickInMillisecond + defaultGCTick + 1
+	s := pp.nextCtx()
+	pp.add(s, []*RequestState{rs})
+	if len(pp.batches) != 1 {
+		t.Fatalf("unexpected batch count")
+	}
+	tickToWait := defaultGCTick * 10
 	for i := uint64(0); i < tickToWait; i++ {
 		pp.tick()
 		pp.applied(499)
 	}
-	select {
-	case v := <-rs.CompletedC:
-		if !v.Timeout() {
-			t.Errorf("got %v, want %d", v, requestTimeout)
-		}
-	default:
-		t.Errorf("expect to complete")
-	}
-	if len(pp.pending) != 0 || len(pp.mapping) != 0 {
-		t.Errorf("leaking records")
-	}
-}
-
-func TestPendingSCReadCanExpireWithoutCallingAddReadyToRead(t *testing.T) {
-	pp, _ := getPendingSCRead()
-	timeout := time.Duration(1000 * time.Millisecond)
-	rs, err := pp.read(nil, timeout)
-	if err != nil {
-		t.Errorf("failed to do read")
-	}
-	s := pp.peepNextCtx()
-	pp.addPendingRead(s, []*RequestState{rs})
-	tickToWait := 1000/testTickInMillisecond + defaultGCTick + 1
-	for i := uint64(0); i < tickToWait; i++ {
-		pp.tick()
-		pp.applied(499)
-	}
-	select {
-	case v := <-rs.CompletedC:
-		if !v.Timeout() {
-			t.Errorf("got %v, want %d", v, requestTimeout)
-		}
-	default:
-		t.Errorf("expect to complete")
-	}
-	if len(pp.pending) != 0 || len(pp.mapping) != 0 {
-		t.Errorf("leaking records")
-	}
-}
-
-func TestExpiredSystemGcWillBeCollected(t *testing.T) {
-	pp, _ := getPendingSCRead()
-	if len(pp.systemGcTime) != 0 {
-		t.Fatalf("systemGcTime is not empty")
-	}
-	expireTick := sysGcMillisecond / pp.tickInMillisecond
-	for i := uint64(0); i < expireTick+1; i++ {
-		pp.nextCtx()
-		pp.tick()
-	}
-	if uint64(len(pp.systemGcTime)) != expireTick+1 {
-		t.Errorf("unexpected system gc time length")
-	}
-	et := pp.systemGcTime[1].expireTime
-	ctx := pp.systemGcTime[1].ctx
-	now := pp.getTick()
-	pp.gc(now)
-	if uint64(len(pp.systemGcTime)) != expireTick {
-		t.Errorf("unexpected system gc time length")
-	}
-	if pp.systemGcTime[0].expireTime != et ||
-		pp.systemGcTime[0].ctx != ctx {
-		t.Errorf("unexpected systemGcTime rec")
-	}
-}
-
-func TestSystemGcTimeInSCReadCanBeCleanedUp(t *testing.T) {
-	pp, _ := getPendingSCRead()
-	for i := 0; i < 100000; i++ {
-		pp.nextCtx()
-	}
-	if len(pp.systemGcTime) < 100000 {
-		t.Errorf("len(pp.systemGcTime)=%d, want >100000", len(pp.systemGcTime))
-	}
-	for i := 0; i < 100000; i++ {
-		pp.tick()
-		pp.applied(499)
-	}
-	pp.applied(499)
-	if len(pp.systemGcTime) != 0 {
-		t.Errorf("not cleaning up systemGcTime")
+	if len(pp.batches) == 0 {
+		t.Fatalf("unexpectedly removed batch")
 	}
 }
 
@@ -1125,11 +1118,11 @@ func TestProposalAllocationCount(t *testing.T) {
 	total := uint64(0)
 	q := newEntryQueue(2048, 0)
 	cfg := config.Config{ClusterID: 1, NodeID: 1}
-	pp := newPendingProposal(cfg, p, q, "localhost:9090", 200)
+	pp := newPendingProposal(cfg, false, p, q, "localhost:9090")
 	session := client.NewNoOPSession(1, random.LockGuardedRand)
 	ac := testing.AllocsPerRun(1000, func() {
 		v := atomic.AddUint64(&total, 1)
-		rs, err := pp.propose(session, data, nil, time.Second)
+		rs, err := pp.propose(session, data, 100)
 		if err != nil {
 			t.Errorf("%v", err)
 		}
@@ -1156,10 +1149,10 @@ func TestReadIndexAllocationCount(t *testing.T) {
 	}
 	total := uint64(0)
 	q := newReadIndexQueue(2048)
-	pri := newPendingReadIndex(p, q, 200)
+	pri := newPendingReadIndex(p, q)
 	ac := testing.AllocsPerRun(1000, func() {
 		v := atomic.AddUint64(&total, 1)
-		rs, err := pri.read(nil, time.Second)
+		rs, err := pri.read(100)
 		if err != nil {
 			t.Errorf("%v", err)
 		}

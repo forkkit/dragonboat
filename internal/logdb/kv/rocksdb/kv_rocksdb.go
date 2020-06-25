@@ -16,30 +16,51 @@ package rocksdb
 
 import (
 	"bytes"
+	"sync"
+	"sync/atomic"
 
+	"github.com/lni/dragonboat/v3/config"
+	"github.com/lni/dragonboat/v3/internal/fileutil"
 	"github.com/lni/dragonboat/v3/internal/logdb/kv"
 	"github.com/lni/dragonboat/v3/internal/logdb/kv/rocksdb/gorocksdb"
 	"github.com/lni/dragonboat/v3/internal/settings"
+	"github.com/lni/dragonboat/v3/internal/vfs"
 	"github.com/lni/dragonboat/v3/logger"
 	"github.com/lni/dragonboat/v3/raftio"
-	"github.com/lni/goutils/fileutil"
 )
 
 var (
 	plog = logger.GetLogger("rocksdb")
 )
 
-var (
-	logDBLRUCacheSize        = int(settings.Soft.RDBLRUCacheSize)
-	maxBackgroundCompactions = int(settings.Soft.RDBMaxBackgroundCompactions)
-	maxBackgroundFlushes     = int(settings.Soft.RDBMaxBackgroundFlushes)
-	keepLogFileNum           = int(settings.Soft.RDBKeepLogFileNum)
+const (
+	maxLogFileSize = 1024 * 1024 * 128
 )
 
+var versionWarning sync.Once
+
 // NewKVStore returns a RocksDB based IKVStore instance.
-func NewKVStore(dir string, wal string) (kv.IKVStore, error) {
-	return openRocksDB(dir, wal)
+func NewKVStore(config config.LogDBConfig,
+	dir string, wal string, fs vfs.IFS) (kv.IKVStore, error) {
+	if fs != vfs.DefaultFS {
+		panic("only vfs.DefaultFS is supported")
+	}
+	checkRocksDBVersion()
+	return openRocksDB(config, dir, wal, fs)
 }
+
+func checkRocksDBVersion() {
+	major := gorocksdb.GetRocksDBVersionMajor()
+	minor := gorocksdb.GetRocksDBVersionMinor()
+	if major > 6 || (major == 6 && minor >= 3) {
+		return
+	}
+	versionWarning.Do(func() {
+		plog.Warningf("RocksDB v6.3.x is required, v6.4.x is recommended")
+	})
+}
+
+var _ kv.IKVStore = &KV{}
 
 // KV is a RocksDB based IKVStore type.
 type KV struct {
@@ -52,18 +73,40 @@ type KV struct {
 	opts      *gorocksdb.Options
 }
 
-// FIXME:
-// move these option parameters to the settings package to make it configurable
-func getRocksDBOptions(directory string,
-	walDirectory string) (*gorocksdb.Options,
+var tolerateTailCorruptionWarning uint32
+var useUniversalCompactionWarning uint32
+
+func getRocksDBOptions(config config.LogDBConfig,
+	directory string, walDirectory string) (*gorocksdb.Options,
 	*gorocksdb.BlockBasedTableOptions, *gorocksdb.Cache) {
+	// TODO:
+	// log the settings
+	blockSize := int(config.KVBlockSize)
+	logDBLRUCacheSize := int(config.KVLRUCacheSize)
+	maxBackgroundCompactions := int(config.KVMaxBackgroundCompactions)
+	maxBackgroundFlushes := int(config.KVMaxBackgroundFlushes)
+	keepLogFileNum := int(config.KVKeepLogFileNum)
+	writeBufferSize := int(config.KVWriteBufferSize)
+	maxWriteBufferNumber := int(config.KVMaxWriteBufferNumber)
+	l0FileNumCompactionTrigger := int(config.KVLevel0FileNumCompactionTrigger)
+	l0SlowdownWritesTrigger := int(config.KVLevel0SlowdownWritesTrigger)
+	l0StopWritesTrigger := int(config.KVLevel0StopWritesTrigger)
+	numOfLevels := int(config.KVNumOfLevels)
+	maxBytesForLevelBase := config.KVMaxBytesForLevelBase
+	maxBytesForLevelMultiplier := float64(config.KVMaxBytesForLevelMultiplier)
+	targetFileSizeBase := config.KVTargetFileSizeBase
+	targetFileSizeMultiplier := int(config.KVTargetFileSizeMultiplier)
+	dynamicLevelBytes := config.KVLevelCompactionDynamicLevelBytes
+	recycleLogFileNum := int(config.KVRecycleLogFileNum)
+	tolerateTailCorruption := settings.Soft.KVTolerateCorruptedTailRecords
+	useUniversalCompaction := settings.Soft.KVUseUniversalCompaction
+	// generate the options
 	bbto := gorocksdb.NewDefaultBlockBasedTableOptions()
 	bbto.SetWholeKeyFiltering(true)
-	bbto.SetBlockSize(32 * 1024)
+	bbto.SetBlockSize(blockSize)
 	var cache *gorocksdb.Cache
 	if inMonkeyTesting {
-		cache = gorocksdb.NewLRUCache(1024 * 512)
-		bbto.SetBlockCache(cache)
+		bbto.SetNoBlockCache(true)
 	} else {
 		if logDBLRUCacheSize > 0 {
 			cache = gorocksdb.NewLRUCache(logDBLRUCacheSize)
@@ -73,8 +116,8 @@ func getRocksDBOptions(directory string,
 		}
 	}
 	opts := gorocksdb.NewDefaultOptions()
-	opts.SetMaxManifestFileSize(1024 * 1024 * 128)
-	opts.SetMaxLogFileSize(1024 * 1024 * 128)
+	opts.SetMaxManifestFileSize(maxLogFileSize)
+	opts.SetMaxLogFileSize(maxLogFileSize)
 	opts.SetKeepLogFileNum(keepLogFileNum)
 	opts.SetBlockBasedTableFactory(bbto)
 	opts.SetCreateIfMissing(true)
@@ -82,20 +125,15 @@ func getRocksDBOptions(directory string,
 	if len(walDirectory) > 0 {
 		opts.SetWalDir(walDirectory)
 	}
-	ddio := directIOSupported(directory)
-	wdio := directIOSupported(walDirectory)
-	if ddio && wdio {
-		opts.SetUseDirectIOForFlushAndCompaction(true)
-	}
 	opts.SetCompression(gorocksdb.NoCompression)
 	if inMonkeyTesting {
 		// rocksdb perallocates size for its log file and the size is calculated
 		// based on the write buffer size.
 		opts.SetWriteBufferSize(512 * 1024)
 	} else {
-		opts.SetWriteBufferSize(256 * 1024 * 1024)
+		opts.SetWriteBufferSize(writeBufferSize)
 	}
-	// in normal mode, by default, we try to minimize write amplifcation, we have
+	// by default, in our deployments, we try to minimize write amplifcation -
 	// L0 size = 256MBytes * 2 (min_write_buffer_number_to_merge) * \
 	//              8 (level0_file_num_compaction_trigger)
 	//         = 4GBytes
@@ -104,48 +142,49 @@ func getRocksDBOptions(directory string,
 	// L2 size is 8G, L3 is 16G, L4 is 32G, L5 64G...
 	//
 	// note this is the size of a shard, and the content of the rdb is expected
-	// to be compacted by raft.
-	//
-	opts.SetLevel0FileNumCompactionTrigger(8)
-	opts.SetLevel0SlowdownWritesTrigger(17)
-	opts.SetLevel0StopWritesTrigger(24)
-	opts.SetMaxWriteBufferNumber(25)
-	opts.SetNumLevels(7)
-	// MaxBytesForLevelBase is the total size of L1, should be close to the size
-	// of L0
-	opts.SetMaxBytesForLevelBase(4 * 1024 * 1024 * 1024)
-	opts.SetMaxBytesForLevelMultiplier(2)
-	// files in L1 will have TargetFileSizeBase bytes
-	opts.SetTargetFileSizeBase(256 * 1024 * 1024)
-	opts.SetTargetFileSizeMultiplier(1)
-	// IO parallism
+	// to be regularly compacted by raft. users are also free to change these
+	// settings when they feel necessary.
+	opts.SetLevel0FileNumCompactionTrigger(l0FileNumCompactionTrigger)
+	opts.SetLevel0SlowdownWritesTrigger(l0SlowdownWritesTrigger)
+	opts.SetLevel0StopWritesTrigger(l0StopWritesTrigger)
+	opts.SetMaxWriteBufferNumber(maxWriteBufferNumber)
+	opts.SetNumLevels(numOfLevels)
+	opts.SetMaxBytesForLevelBase(maxBytesForLevelBase)
+	opts.SetMaxBytesForLevelMultiplier(maxBytesForLevelMultiplier)
+	opts.SetTargetFileSizeBase(targetFileSizeBase)
+	opts.SetTargetFileSizeMultiplier(targetFileSizeMultiplier)
 	opts.SetMaxBackgroundCompactions(maxBackgroundCompactions)
 	opts.SetMaxBackgroundFlushes(maxBackgroundFlushes)
+	opts.SetRecycleLogFileNum(recycleLogFileNum)
+	if tolerateTailCorruption {
+		if atomic.CompareAndSwapUint32(&tolerateTailCorruptionWarning, 0, 1) {
+			plog.Infof("RocksDB's recovery mode set to kTolerateCorruptedTailRecords")
+		}
+		opts.SetWALRecoveryMode(gorocksdb.TolerateCorruptedTailRecords)
+	}
+	if useUniversalCompaction {
+		if atomic.CompareAndSwapUint32(&useUniversalCompactionWarning, 0, 1) {
+			plog.Infof("use Universal Compaction in RocksDB")
+		}
+		opts.SetCompactionStyle(gorocksdb.UniversalCompactionStyle)
+	}
+	if dynamicLevelBytes != 0 {
+		opts.SetLevelCompactionDynamicLevelBytes(true)
+	}
 	return opts, bbto, cache
 }
 
-func openRocksDB(dir string, wal string) (*KV, error) {
+func openRocksDB(config config.LogDBConfig,
+	dir string, wal string, fs vfs.IFS) (kv.IKVStore, error) {
+	if config.IsEmpty() {
+		panic("invalid LogDBConfig")
+	}
 	// gorocksdb.OpenDb allows the main db directory to be created on open
 	// but WAL directory must exist before calling Open.
-	walExist, err := fileutil.Exist(wal)
-	if err != nil {
-		return nil, err
+	if err := fileutil.MkdirAll(wal, fs); err != nil {
+		panic(err)
 	}
-	if len(wal) > 0 && !walExist {
-		if err := fileutil.Mkdir(wal); err != nil {
-			plog.Panicf("cannot create dir for RDB WAL (%v)", err)
-		}
-	}
-	dirExist, err := fileutil.Exist(dir)
-	if err != nil {
-		return nil, err
-	}
-	if !dirExist {
-		if err := fileutil.Mkdir(dir); err != nil {
-			plog.Panicf("cannot create dir (%v)", err)
-		}
-	}
-	opts, bbto, cache := getRocksDBOptions(dir, wal)
+	opts, bbto, cache := getRocksDBOptions(config, dir, wal)
 	db, err := gorocksdb.OpenDb(opts, dir)
 	if err != nil {
 		return nil, err
@@ -292,14 +331,14 @@ func (r *KV) CommitWriteBatch(wb kv.IWriteBatch) error {
 
 // BulkRemoveEntries returns the keys specified by the input range.
 func (r *KV) BulkRemoveEntries(fk []byte, lk []byte) error {
-	return nil
+	wb := gorocksdb.NewWriteBatch()
+	defer wb.Destroy()
+	wb.DeleteRange(fk, lk)
+	return r.db.Write(r.wo, wb)
 }
 
 // CompactEntries compacts the specified key range.
 func (r *KV) CompactEntries(fk []byte, lk []byte) error {
-	if err := r.deleteRange(fk, lk); err != nil {
-		return err
-	}
 	opts := gorocksdb.NewCompactionOptions()
 	opts.SetExclusiveManualCompaction(false)
 	opts.SetChangeLevel(true)
@@ -331,37 +370,5 @@ func (r *KV) FullCompaction() error {
 		Limit: lk,
 	}
 	r.db.CompactRangeWithOptions(opts, rng)
-	return nil
-}
-
-func (r *KV) deleteRange(fk []byte, lk []byte) error {
-	iter := r.db.NewIterator(r.ro)
-	defer iter.Close()
-	wb := gorocksdb.NewWriteBatch()
-	defer wb.Destroy()
-	for iter.Seek(fk); ; iter.Next() {
-		v, err := iter.IsValid()
-		if err != nil {
-			return err
-		}
-		if !v {
-			break
-		}
-		key, ok := iter.OKey()
-		if !ok {
-			panic("failed to get key")
-		}
-		kd := key.Data()
-		if bytes.Compare(kd, lk) < 0 {
-			wb.Delete(kd)
-			key.Free()
-		} else {
-			key.Free()
-			break
-		}
-	}
-	if wb.Count() > 0 {
-		return r.db.Write(r.wo, wb)
-	}
 	return nil
 }

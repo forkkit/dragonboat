@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,11 +15,11 @@
 package rsm
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/lni/goutils/leaktest"
+
+	"github.com/lni/dragonboat/v3/internal/vfs"
 )
 
 const (
@@ -58,14 +58,20 @@ func TestFileWithDuplicatedIDCanNotBeAdded(t *testing.T) {
 }
 
 func TestPrepareFiles(t *testing.T) {
+	fs := vfs.GetTestFS()
+	if fs != vfs.DefaultFS {
+		t.Skip("this test only support the default fs")
+	}
 	defer leaktest.AfterTest(t)()
-	if err := os.MkdirAll(rdbTestDirectory, 0755); err != nil {
+	if err := fs.MkdirAll(rdbTestDirectory, 0755); err != nil {
 		t.Errorf("failed to make dir %v", err)
 	}
 	defer func() {
-		os.RemoveAll(rdbTestDirectory)
+		if err := fs.RemoveAll(rdbTestDirectory); err != nil {
+			t.Fatalf("%v", err)
+		}
 	}()
-	f1, err := os.Create(filepath.Join(rdbTestDirectory, "test1.data"))
+	f1, err := fs.Create(fs.PathJoin(rdbTestDirectory, "test1.data"))
 	if err != nil {
 		t.Fatalf("failed to create the file, %v", err)
 	}
@@ -74,7 +80,7 @@ func TestPrepareFiles(t *testing.T) {
 		t.Fatalf("failed to write file %v", err)
 	}
 	f1.Close()
-	f2, err := os.Create(filepath.Join(rdbTestDirectory, "test2.data"))
+	f2, err := fs.Create(fs.PathJoin(rdbTestDirectory, "test2.data"))
 	if err != nil {
 		t.Fatalf("failed to create the file, %v", err)
 	}
@@ -84,15 +90,15 @@ func TestPrepareFiles(t *testing.T) {
 	}
 	f2.Close()
 	fc := NewFileCollection()
-	fc.AddFile(1, filepath.Join(rdbTestDirectory, "test1.data"), make([]byte, 8))
-	fc.AddFile(2, filepath.Join(rdbTestDirectory, "test2.data"), make([]byte, 2))
+	fc.AddFile(1, fs.PathJoin(rdbTestDirectory, "test1.data"), make([]byte, 8))
+	fc.AddFile(2, fs.PathJoin(rdbTestDirectory, "test2.data"), make([]byte, 2))
 	if fc.Size() != 2 {
 		t.Errorf("unexpected collection size")
 	}
 	rf := fc.GetFileAt(0)
-	if rf.Filepath != filepath.Join(rdbTestDirectory, "test1.data") {
+	if rf.Filepath != fs.PathJoin(rdbTestDirectory, "test1.data") {
 		t.Errorf("unexpected path, got %s, want %s",
-			rf.Filepath, filepath.Join(rdbTestDirectory, "test1.data"))
+			rf.Filepath, fs.PathJoin(rdbTestDirectory, "test1.data"))
 	}
 	files, err := fc.PrepareFiles(rdbTestDirectory, rdbTestDirectory)
 	if err != nil {
@@ -104,14 +110,14 @@ func TestPrepareFiles(t *testing.T) {
 	if files[1].FileId != 2 || files[1].Filename() != "external-file-2" || files[1].FileSize != 32 {
 		t.Errorf("unexpected returned file record %v", files[1])
 	}
-	fi1, err := os.Stat(filepath.Join(rdbTestDirectory, "external-file-1"))
+	fi1, err := fs.Stat(fs.PathJoin(rdbTestDirectory, "external-file-1"))
 	if err != nil {
 		t.Errorf("failed to get stat, %v", err)
 	}
 	if fi1.Size() != 16 {
 		t.Errorf("unexpected size")
 	}
-	fi2, err := os.Stat(filepath.Join(rdbTestDirectory, "external-file-2"))
+	fi2, err := fs.Stat(fs.PathJoin(rdbTestDirectory, "external-file-2"))
 	if err != nil {
 		t.Errorf("failed to get stat, %v", err)
 	}

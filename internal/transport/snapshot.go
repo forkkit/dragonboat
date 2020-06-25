@@ -14,7 +14,7 @@
 //
 //
 //
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -39,10 +39,11 @@ import (
 	"errors"
 	"sync/atomic"
 
+	"github.com/lni/dragonboat/v3/internal/rsm"
 	"github.com/lni/dragonboat/v3/internal/settings"
+	"github.com/lni/dragonboat/v3/internal/vfs"
 	"github.com/lni/dragonboat/v3/raftio"
 	pb "github.com/lni/dragonboat/v3/raftpb"
-	"github.com/lni/goutils/fileutil"
 )
 
 var (
@@ -50,9 +51,9 @@ var (
 	maxConnectionCount uint32 = uint32(settings.Soft.MaxSnapshotConnections)
 )
 
-// ASyncSendSnapshot sends raft snapshot message to its target.
-func (t *Transport) ASyncSendSnapshot(m pb.Message) bool {
-	if !t.asyncSendSnapshot(m) {
+// SendSnapshot asynchronously sends raft snapshot message to its target.
+func (t *Transport) SendSnapshot(m pb.Message) bool {
+	if !t.sendSnapshot(m) {
 		plog.Errorf("failed to send snapshot to %s", dn(m.ClusterId, m.To))
 		t.sendSnapshotNotification(m.ClusterId, m.To, true)
 		return false
@@ -60,16 +61,17 @@ func (t *Transport) ASyncSendSnapshot(m pb.Message) bool {
 	return true
 }
 
-// GetStreamConnection returns a connection used for streaming snapshot.
-func (t *Transport) GetStreamConnection(clusterID uint64, nodeID uint64) *Sink {
-	s := t.getStreamConnection(clusterID, nodeID)
+// GetStreamSink returns a connection used for streaming snapshot.
+func (t *Transport) GetStreamSink(clusterID uint64, nodeID uint64) *Sink {
+	s := t.getStreamSink(clusterID, nodeID)
 	if s == nil {
+		plog.Errorf("failed to connect to %s", dn(clusterID, nodeID))
 		t.sendSnapshotNotification(clusterID, nodeID, true)
 	}
 	return s
 }
 
-func (t *Transport) getStreamConnection(clusterID uint64, nodeID uint64) *Sink {
+func (t *Transport) getStreamSink(clusterID uint64, nodeID uint64) *Sink {
 	addr, _, err := t.resolver.Resolve(clusterID, nodeID)
 	if err != nil {
 		return nil
@@ -78,19 +80,19 @@ func (t *Transport) getStreamConnection(clusterID uint64, nodeID uint64) *Sink {
 		return nil
 	}
 	key := raftio.GetNodeInfo(clusterID, nodeID)
-	if c := t.tryCreateLane(key, addr, true, 0); c != nil {
-		return &Sink{l: c}
+	if job := t.createJob(key, addr, true, 0); job != nil {
+		return &Sink{j: job}
 	}
 	return nil
 }
 
-func (t *Transport) asyncSendSnapshot(m pb.Message) bool {
+func (t *Transport) sendSnapshot(m pb.Message) bool {
 	toNodeID := m.To
 	clusterID := m.ClusterId
 	if m.Type != pb.InstallSnapshot {
 		panic("non-snapshot message received by ASyncSendSnapshot")
 	}
-	chunks := splitSnapshotMessage(m)
+	chunks := splitSnapshotMessage(m, t.fs)
 	addr, _, err := t.resolver.Resolve(clusterID, toNodeID)
 	if err != nil {
 		return false
@@ -100,43 +102,36 @@ func (t *Transport) asyncSendSnapshot(m pb.Message) bool {
 		return false
 	}
 	key := raftio.GetNodeInfo(clusterID, toNodeID)
-	c := t.tryCreateLane(key, addr, false, len(chunks))
-	if c == nil {
+	job := t.createJob(key, addr, false, len(chunks))
+	if job == nil {
 		return false
 	}
-	c.sendSavedSnapshot(m)
+	job.addSnapshot(m)
 	return true
 }
 
-func (t *Transport) tryCreateLane(key raftio.NodeInfo,
-	addr string, streaming bool, sz int) *lane {
-	if v := atomic.AddUint32(&t.lanes, 1); v > maxConnectionCount {
-		r := atomic.AddUint32(&t.lanes, ^uint32(0))
-		plog.Errorf("lane count is rate limited %d", r)
+func (t *Transport) createJob(key raftio.NodeInfo,
+	addr string, streaming bool, sz int) *job {
+	if v := atomic.AddUint32(&t.jobs, 1); v > maxConnectionCount {
+		r := atomic.AddUint32(&t.jobs, ^uint32(0))
+		plog.Errorf("job count is rate limited %d", r)
 		return nil
 	}
-	return t.createConnection(key, addr, streaming, sz)
-}
-
-func (t *Transport) createConnection(key raftio.NodeInfo,
-	addr string, streaming bool, sz int) *lane {
-	c := newLane(t.ctx, key.ClusterID, key.NodeID,
-		t.getDeploymentID(), streaming, sz, t.raftRPC, t.stopper.ShouldStop())
-	c.streamChunkSent = t.streamChunkSent
-	c.preStreamChunkSend = t.preStreamChunkSend
+	job := newJob(t.ctx, key.ClusterID, key.NodeID, t.nhConfig.GetDeploymentID(),
+		streaming, sz, t.trans, t.stopper.ShouldStop(), t.fs)
+	job.streamChunkSent = t.streamChunkSent
+	job.preStreamChunkSend = t.preStreamChunkSend
 	shutdown := func() {
-		atomic.AddUint32(&t.lanes, ^uint32(0))
+		atomic.AddUint32(&t.jobs, ^uint32(0))
 	}
 	t.stopper.RunWorker(func() {
-		t.connectAndProcessSnapshot(c, addr)
-		plog.Infof("%s connectAndProcessSnapshot returned",
-			dn(key.ClusterID, key.NodeID))
+		t.processSnapshot(job, addr)
 		shutdown()
 	})
-	return c
+	return job
 }
 
-func (t *Transport) connectAndProcessSnapshot(c *lane, addr string) {
+func (t *Transport) processSnapshot(c *job, addr string) {
 	breaker := t.GetCircuitBreaker(addr)
 	successes := breaker.Successes()
 	consecFailures := breaker.ConsecFailures()
@@ -144,7 +139,7 @@ func (t *Transport) connectAndProcessSnapshot(c *lane, addr string) {
 	nodeID := c.nodeID
 	if err := func() error {
 		if err := c.connect(addr); err != nil {
-			plog.Warningf("failed to get snapshot client to %s", dn(clusterID, nodeID))
+			plog.Warningf("failed to get snapshot conn to %s", dn(clusterID, nodeID))
 			t.sendSnapshotNotification(clusterID, nodeID, true)
 			close(c.failed)
 			t.metrics.snapshotCnnectionFailure()
@@ -155,16 +150,18 @@ func (t *Transport) connectAndProcessSnapshot(c *lane, addr string) {
 		if successes == 0 || consecFailures > 0 {
 			plog.Infof("snapshot stream to %s (%s) established",
 				dn(clusterID, nodeID), addr)
+			t.sysEvents.ConnectionEstablished(addr, true)
 		}
 		err := c.process()
 		if err != nil {
-			plog.Errorf("snapshot chunk processing failed %v", err)
+			plog.Errorf("snapshot chunk processing failed: %v", err)
 		}
 		t.sendSnapshotNotification(clusterID, nodeID, err != nil)
 		return err
 	}(); err != nil {
-		plog.Warningf("connectAndProcessSnapshot failed: %v", err)
+		plog.Warningf("processSnapshot failed: %v", err)
 		breaker.Fail()
+		t.sysEvents.ConnectionFailed(addr, true)
 	}
 }
 
@@ -174,10 +171,6 @@ func (t *Transport) sendSnapshotNotification(clusterID uint64,
 		t.metrics.snapshotSendFailure()
 	} else {
 		t.metrics.snapshotSendSuccess()
-	}
-	if t.handlerRemoved() {
-		plog.Warningf("snapshot notification to %s ignored", dn(clusterID, nodeID))
-		return
 	}
 	handler := t.handler.Load()
 	if handler != nil {
@@ -192,14 +185,12 @@ func (t *Transport) sendSnapshotNotification(clusterID uint64,
 
 func splitBySnapshotFile(msg pb.Message,
 	filepath string, filesize uint64, startChunkID uint64,
-	sf *pb.SnapshotFile) []pb.SnapshotChunk {
+	sf *pb.SnapshotFile) []pb.Chunk {
 	if filesize == 0 {
-		panic("empty file included in snapshot")
+		panic("empty file")
 	}
-	results := make([]pb.SnapshotChunk, 0)
+	results := make([]pb.Chunk, 0)
 	chunkCount := uint64((filesize-1)/snapshotChunkSize + 1)
-	plog.Infof("splitBySnapshotFile called, chunkCount %d, filesize %d",
-		chunkCount, filesize)
 	for i := uint64(0); i < chunkCount; i++ {
 		var csz uint64
 		if i == chunkCount-1 {
@@ -207,7 +198,7 @@ func splitBySnapshotFile(msg pb.Message,
 		} else {
 			csz = snapshotChunkSize
 		}
-		c := pb.SnapshotChunk{
+		c := pb.Chunk{
 			BinVer:         raftio.RPCBinVersion,
 			ClusterId:      msg.ClusterId,
 			NodeId:         msg.To,
@@ -222,6 +213,7 @@ func splitBySnapshotFile(msg pb.Message,
 			Membership:     msg.Snapshot.Membership,
 			Filepath:       filepath,
 			FileSize:       filesize,
+			Witness:        msg.Snapshot.Witness,
 		}
 		if sf != nil {
 			c.HasFileInfo = true
@@ -232,10 +224,7 @@ func splitBySnapshotFile(msg pb.Message,
 	return results
 }
 
-func splitSnapshotMessage(m pb.Message) []pb.SnapshotChunk {
-	if m.Type != pb.InstallSnapshot {
-		panic("not a snapshot message")
-	}
+func getChunks(m pb.Message) []pb.Chunk {
 	startChunkID := uint64(0)
 	results := splitBySnapshotFile(m,
 		m.Snapshot.Filepath, m.Snapshot.FileSize, startChunkID, nil)
@@ -252,26 +241,61 @@ func splitSnapshotMessage(m pb.Message) []pb.SnapshotChunk {
 	return results
 }
 
-func loadSnapshotChunkData(chunk pb.SnapshotChunk,
-	data []byte) ([]byte, error) {
-	f, err := fileutil.OpenChunkFileForRead(chunk.Filepath)
+func getWitnessChunk(m pb.Message, fs vfs.IFS) []pb.Chunk {
+	ss, err := rsm.GetWitnessSnapshot(fs)
+	if err != nil {
+		panic(err)
+	}
+	results := make([]pb.Chunk, 0)
+	results = append(results, pb.Chunk{
+		BinVer:         raftio.RPCBinVersion,
+		ClusterId:      m.ClusterId,
+		NodeId:         m.To,
+		From:           m.From,
+		FileChunkId:    0,
+		FileChunkCount: 1,
+		ChunkId:        0,
+		ChunkCount:     1,
+		ChunkSize:      uint64(len(ss)),
+		Index:          m.Snapshot.Index,
+		Term:           m.Snapshot.Term,
+		OnDiskIndex:    0,
+		Membership:     m.Snapshot.Membership,
+		Filepath:       "witness.snapshot",
+		FileSize:       uint64(len(ss)),
+		Witness:        true,
+		Data:           ss,
+	})
+	return results
+}
+
+func splitSnapshotMessage(m pb.Message, fs vfs.IFS) []pb.Chunk {
+	if m.Type != pb.InstallSnapshot {
+		panic("not a snapshot message")
+	}
+	if m.Snapshot.Witness {
+		return getWitnessChunk(m, fs)
+	}
+	return getChunks(m)
+}
+
+func loadChunkData(chunk pb.Chunk,
+	data []byte, fs vfs.IFS) ([]byte, error) {
+	f, err := OpenChunkFileForRead(chunk.Filepath, fs)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 	offset := chunk.FileChunkId * snapshotChunkSize
-	if _, err = f.SeekFromBeginning(int64(offset)); err != nil {
-		return nil, err
-	}
 	if chunk.ChunkSize != uint64(len(data)) {
 		data = make([]byte, chunk.ChunkSize)
 	}
-	n, err := f.Read(data)
+	n, err := f.ReadAt(data, int64(offset))
 	if err != nil {
 		return nil, err
 	}
 	if uint64(n) != chunk.ChunkSize {
-		return nil, errors.New("failed to read the chunk from snapshot file")
+		return nil, errors.New("failed to read the snapshot chunk")
 	}
 	return data, nil
 }

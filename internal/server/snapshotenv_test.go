@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,12 +15,18 @@
 package server
 
 import (
-	"os"
 	"strings"
 	"testing"
 
+	gvfs "github.com/lni/goutils/vfs"
+
+	"github.com/lni/dragonboat/v3/internal/vfs"
 	pb "github.com/lni/dragonboat/v3/raftpb"
 )
+
+func reportLeakedFD(fs vfs.IFS, t *testing.T) {
+	gvfs.ReportLeakedFD(fs, t)
+}
 
 func TestGetSnapshotDirName(t *testing.T) {
 	v := GetSnapshotDirName(1)
@@ -67,23 +73,26 @@ func TestTempSuffix(t *testing.T) {
 	f := func(cid uint64, nid uint64) string {
 		return "/data"
 	}
-	env := NewSSEnv(f, 1, 1, 1, 2, SnapshottingMode)
+	fs := vfs.GetTestFS()
+	env := NewSSEnv(f, 1, 1, 1, 2, SnapshottingMode, fs)
 	dir := env.GetTempDir()
 	if !strings.Contains(dir, ".generating") {
 		t.Errorf("unexpected suffix")
 	}
-	env = NewSSEnv(f, 1, 1, 1, 2, ReceivingMode)
+	env = NewSSEnv(f, 1, 1, 1, 2, ReceivingMode, fs)
 	dir = env.GetTempDir()
 	if !strings.Contains(dir, ".receiving") {
 		t.Errorf("unexpected suffix: %s", dir)
 	}
+	reportLeakedFD(fs, t)
 }
 
 func TestFinalSnapshotDirDoesNotContainTempSuffix(t *testing.T) {
 	f := func(cid uint64, nid uint64) string {
 		return "/data"
 	}
-	env := NewSSEnv(f, 1, 1, 1, 2, SnapshottingMode)
+	fs := vfs.GetTestFS()
+	env := NewSSEnv(f, 1, 1, 1, 2, SnapshottingMode, fs)
 	dir := env.GetFinalDir()
 	if strings.Contains(dir, ".generating") {
 		t.Errorf("unexpected suffix")
@@ -94,66 +103,70 @@ func TestRootDirIsTheParentOfTempFinalDirs(t *testing.T) {
 	f := func(cid uint64, nid uint64) string {
 		return "/data"
 	}
-	env := NewSSEnv(f, 1, 1, 1, 2, SnapshottingMode)
+	fs := vfs.GetTestFS()
+	env := NewSSEnv(f, 1, 1, 1, 2, SnapshottingMode, fs)
 	tmpDir := env.GetTempDir()
 	finalDir := env.GetFinalDir()
 	rootDir := env.GetRootDir()
 	mustBeChild(rootDir, tmpDir)
 	mustBeChild(rootDir, finalDir)
+	reportLeakedFD(fs, t)
 }
 
-func runEnvTest(t *testing.T, f func(t *testing.T, env *SSEnv)) {
+func runEnvTest(t *testing.T, f func(t *testing.T, env *SSEnv), fs vfs.IFS) {
 	rd := "server-pkg-test-data-safe-to-delete"
-	ff := func(cid uint64, nid uint64) string {
-		return rd
-	}
 	defer func() {
-		os.RemoveAll(rd)
+		if err := fs.RemoveAll(rd); err != nil {
+			t.Fatalf("%v", err)
+		}
 	}()
-	env := NewSSEnv(ff, 1, 1, 1, 2, SnapshottingMode)
-	tmpDir := env.GetTempDir()
-	if err := os.MkdirAll(tmpDir, 0755); err != nil {
-		t.Fatalf("%v", err)
-	}
-	f(t, env)
+	func() {
+		ff := func(cid uint64, nid uint64) string {
+			return rd
+		}
+		env := NewSSEnv(ff, 1, 1, 1, 2, SnapshottingMode, fs)
+		tmpDir := env.GetTempDir()
+		if err := fs.MkdirAll(tmpDir, 0755); err != nil {
+			t.Fatalf("%v", err)
+		}
+		f(t, env)
+	}()
+	reportLeakedFD(fs, t)
 }
 
 func TestRenameTempDirToFinalDir(t *testing.T) {
 	tf := func(t *testing.T, env *SSEnv) {
-		finalDir := env.GetFinalDir()
-		if err := os.MkdirAll(finalDir, 0755); err != nil {
-			t.Fatalf("%v", err)
-		}
-		err := env.renameTempDirToFinalDir()
-		if err != ErrSnapshotOutOfDate {
-			t.Errorf("err is nil")
+		if err := env.renameTempDirToFinalDir(); err != nil {
+			t.Errorf("failed to rename dir, %v", err)
 		}
 	}
-	runEnvTest(t, tf)
+	fs := vfs.GetTestFS()
+	runEnvTest(t, tf, fs)
 }
 
 func TestRenameTempDirToFinalDirCanComplete(t *testing.T) {
 	tf := func(t *testing.T, env *SSEnv) {
-		if env.isFinalDirExists() {
+		if env.finalDirExists() {
 			t.Errorf("final dir already exist")
 		}
 		err := env.renameTempDirToFinalDir()
 		if err != nil {
 			t.Errorf("rename tmp dir to final dir failed %v", err)
 		}
-		if !env.isFinalDirExists() {
+		if !env.finalDirExists() {
 			t.Errorf("final dir does not exist")
 		}
 		if env.HasFlagFile() {
 			t.Errorf("flag file not suppose to be there")
 		}
 	}
-	runEnvTest(t, tf)
+	fs := vfs.GetTestFS()
+	runEnvTest(t, tf, fs)
 }
 
 func TestFlagFileExists(t *testing.T) {
 	tf := func(t *testing.T, env *SSEnv) {
-		if env.isFinalDirExists() {
+		if env.finalDirExists() {
 			t.Errorf("final dir already exist")
 		}
 		msg := &pb.Message{}
@@ -164,14 +177,15 @@ func TestFlagFileExists(t *testing.T) {
 		if err != nil {
 			t.Errorf("rename tmp dir to final dir failed %v", err)
 		}
-		if !env.isFinalDirExists() {
+		if !env.finalDirExists() {
 			t.Errorf("final dir does not exist")
 		}
 		if !env.HasFlagFile() {
 			t.Errorf("flag file not suppose to be there")
 		}
 	}
-	runEnvTest(t, tf)
+	fs := vfs.GetTestFS()
+	runEnvTest(t, tf, fs)
 }
 
 func TestFinalizeSnapshotCanComplete(t *testing.T) {
@@ -183,17 +197,18 @@ func TestFinalizeSnapshotCanComplete(t *testing.T) {
 		if !env.HasFlagFile() {
 			t.Errorf("no flag file")
 		}
-		if !env.isFinalDirExists() {
+		if !env.finalDirExists() {
 			t.Errorf("no final dir")
 		}
 	}
-	runEnvTest(t, tf)
+	fs := vfs.GetTestFS()
+	runEnvTest(t, tf, fs)
 }
 
 func TestFinalizeSnapshotReturnOutOfDateWhenFinalDirExist(t *testing.T) {
 	tf := func(t *testing.T, env *SSEnv) {
 		finalDir := env.GetFinalDir()
-		if err := os.MkdirAll(finalDir, 0755); err != nil {
+		if err := env.fs.MkdirAll(finalDir, 0755); err != nil {
 			t.Fatalf("%v", err)
 		}
 		m := &pb.Message{}
@@ -204,5 +219,6 @@ func TestFinalizeSnapshotReturnOutOfDateWhenFinalDirExist(t *testing.T) {
 			t.Errorf("flag file exist")
 		}
 	}
-	runEnvTest(t, tf)
+	fs := vfs.GetTestFS()
+	runEnvTest(t, tf, fs)
 }

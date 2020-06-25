@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,14 +17,15 @@ package raftpb
 import (
 	"fmt"
 	"math"
-	"os"
 	"strings"
 	"unsafe"
 
+	"github.com/lni/goutils/stringutil"
+
 	"github.com/lni/dragonboat/v3/client"
 	"github.com/lni/dragonboat/v3/internal/settings"
+	"github.com/lni/dragonboat/v3/internal/vfs"
 	"github.com/lni/dragonboat/v3/logger"
-	"github.com/lni/goutils/stringutil"
 )
 
 var (
@@ -231,67 +232,61 @@ func (b *Bootstrap) Validate(nodes map[uint64]string,
 		plog.Errorf("restarting previously joined node, member list %v", nodes)
 		return false
 	}
-	if join && len(nodes) > 0 {
-		plog.Errorf("joining node with member list %v", nodes)
-		return false
-	}
 	if join && len(b.Addresses) > 0 {
 		plog.Errorf("joining node when it is an initial member")
 		return false
 	}
-	ret := true
+	valid := true
 	if len(nodes) > 0 {
 		if len(nodes) != len(b.Addresses) {
-			ret = false
+			valid = false
 		}
 		for nid, addr := range nodes {
 			ba, ok := b.Addresses[nid]
 			if !ok {
-				ret = false
+				valid = false
 			}
 			if strings.Compare(ba, stringutil.CleanAddress(addr)) != 0 {
-				ret = false
+				valid = false
 			}
 		}
 	}
-	if !ret {
+	if !valid {
 		plog.Errorf("inconsistent node list, bootstrap %v, incoming %v",
 			b.Addresses, nodes)
 	}
-	return ret
+	return valid
 }
 
-func checkFileSize(path string, size uint64) {
+func checkFileSize(path string, size uint64, fs vfs.IFS) {
 	var er func(format string, args ...interface{})
-	if panicOnSizeMismatch > 0 {
+	if panicOnSizeMismatch {
 		er = plog.Panicf
 	} else {
 		er = plog.Errorf
 	}
-	if panicOnSizeMismatch > 0 {
-		fs, err := os.Stat(path)
-		if err != nil {
-			plog.Panicf("failed to access %s", path)
-		}
-		if size != uint64(fs.Size()) {
-			er("file %s size %d, expect %d", path, fs.Size(), size)
-		}
+	fi, err := fs.Stat(path)
+	if err != nil {
+		plog.Panicf("failed to access %s", path)
+	}
+	if size != uint64(fi.Size()) {
+		er("file %s size %d, expect %d", path, fi.Size(), size)
 	}
 }
 
 // Validate validates the snapshot instance.
-func (snapshot *Snapshot) Validate() bool {
+func (snapshot *Snapshot) Validate(fs vfs.IFS) bool {
 	if len(snapshot.Filepath) == 0 ||
 		snapshot.FileSize == 0 {
 		return false
 	}
-	checkFileSize(snapshot.Filepath, snapshot.FileSize)
+	checkFileSize(snapshot.Filepath, snapshot.FileSize, fs)
 	for _, f := range snapshot.Files {
 		if len(f.Filepath) == 0 ||
 			f.FileSize == 0 {
 			return false
 		}
-		checkFileSize(f.Filepath, f.FileSize)
+		checkFileSize(f.Filepath, f.FileSize, fs)
 	}
 	return true
 }
@@ -329,7 +324,7 @@ func GetEntrySliceInMemSize(ents []Entry) uint64 {
 // streamed.
 type IChunkSink interface {
 	// return (sent, stopped)
-	Receive(chunk SnapshotChunk) (bool, bool)
+	Receive(chunk Chunk) (bool, bool)
 	Stop()
 	ClusterID() uint64
 	ToNodeID() uint64
@@ -346,18 +341,18 @@ var (
 
 // IsLastChunk returns a boolean value indicating whether the chunk is the last
 // chunk of a snapshot.
-func (c SnapshotChunk) IsLastChunk() bool {
+func (c Chunk) IsLastChunk() bool {
 	return c.ChunkCount == LastChunkCount || c.ChunkCount == c.ChunkId+1
 }
 
 // IsLastFileChunk returns a boolean value indicating whether the chunk is the
 // last chunk of a snapshot file.
-func (c SnapshotChunk) IsLastFileChunk() bool {
+func (c Chunk) IsLastFileChunk() bool {
 	return c.FileChunkId+1 == c.FileChunkCount
 }
 
 // IsPoisonChunk returns a boolean value indicating whether the chunk is a
 // special poison chunk.
-func (c SnapshotChunk) IsPoisonChunk() bool {
+func (c Chunk) IsPoisonChunk() bool {
 	return c.ChunkCount == PoisonChunkCount
 }

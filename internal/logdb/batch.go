@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -35,6 +35,12 @@ import (
 // approach, rather than repeatedly storing the continuously increamental
 // index values and the identifical term values, we represent them in the
 // way implemented in the compactBatchFields function below.
+//
+// The obvious disadvantages of doing these are -
+//  * slightly increased complexity
+//  * last few entries may need to be stored in RAM waiting to be used to
+//    form the next batch, this will increase the memory footprint and
+//    potentially be a problem when there are large number of raft groups
 //
 // To the maximum of our knowledge, dragonboat is the original inventor
 // of the ideas above, they were publicly disclosed on github.com when
@@ -124,6 +130,8 @@ func getMergedFirstBatch(eb pb.EntryBatch, lb pb.EntryBatch) pb.EntryBatch {
 	}
 	return eb
 }
+
+var _ entryManager = &batchedEntries{}
 
 type batchedEntries struct {
 	cs   *rdbcache

@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -65,15 +65,15 @@ func Launch(config *config.Config,
 	logdb ILogDB, events server.IRaftEventListener,
 	addresses []PeerAddress, initial bool, newNode bool) *Peer {
 	checkLaunchRequest(config, addresses, initial, newNode)
+	plog.Infof("%s created, initial: %t, new: %t",
+		dn(config.ClusterID, config.NodeID), initial, newNode)
 	r := newRaft(config, logdb)
 	p := &Peer{raft: r}
 	p.raft.events = events
 	_, lastIndex := logdb.GetRange()
-	if newNode && !config.IsObserver {
+	if newNode && !config.IsObserver && !config.IsWitness {
 		r.becomeFollower(1, NoLeader)
 	}
-	plog.Infof("raft node created, %s, lastIndex %d, initial %t, newNode %t",
-		r.describe(), lastIndex, initial, newNode)
 	if initial && newNode {
 		bootstrap(r, addresses)
 	}
@@ -187,9 +187,12 @@ func (p *Peer) Handle(m pb.Message) {
 	if IsLocalMessageType(m.Type) {
 		panic("local message sent to Step")
 	}
+
 	_, rok := p.raft.remotes[m.From]
 	_, ook := p.raft.observers[m.From]
-	if rok || ook || !isResponseMessageType(m.Type) {
+	_, wok := p.raft.witnesses[m.From]
+
+	if rok || ook || wok || !isResponseMessageType(m.Type) {
 		p.raft.Handle(m)
 	}
 }
@@ -320,7 +323,8 @@ func (p *Peer) entryLog() *entryLog {
 	return p.raft.log
 }
 
-func (p *Peer) getUpdate(moreEntriesToApply bool, lastApplied uint64) pb.Update {
+func (p *Peer) getUpdate(moreEntriesToApply bool,
+	lastApplied uint64) pb.Update {
 	ud := pb.Update{
 		ClusterID:     p.raft.clusterID,
 		NodeID:        p.raft.nodeID,
@@ -359,7 +363,6 @@ func checkLaunchRequest(config *config.Config,
 	if config.NodeID == 0 {
 		panic("config.NodeID must not be zero")
 	}
-	plog.Infof("initial node: %t, new node %t", initial, newNode)
 	if initial && newNode && len(addresses) == 0 {
 		panic("addresses must be specified")
 	}
@@ -378,7 +381,7 @@ func bootstrap(r *raft, addresses []PeerAddress) {
 	})
 	ents := make([]pb.Entry, len(addresses))
 	for i, peer := range addresses {
-		plog.Infof("%s inserting a bootstrap ConfigChangeAddNode, %d, %s",
+		plog.Infof("%s added bootstrap ConfigChangeAddNode, %d, %s",
 			r.describe(), peer.NodeID, string(peer.Address))
 		cc := pb.ConfigChange{
 			Type:       pb.AddNode,

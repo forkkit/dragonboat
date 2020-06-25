@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build !dragonboat_slowtest
-// +build !dragonboat_errorinjectiontest
-
 package dragonboat
 
 import (
@@ -23,9 +20,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/golang/snappy"
+	"github.com/lni/goutils/random"
 
 	"github.com/lni/dragonboat/v3/client"
 	"github.com/lni/dragonboat/v3/config"
@@ -35,10 +32,10 @@ import (
 	"github.com/lni/dragonboat/v3/internal/tests"
 	"github.com/lni/dragonboat/v3/internal/transport"
 	"github.com/lni/dragonboat/v3/internal/utils/dio"
+	"github.com/lni/dragonboat/v3/internal/vfs"
 	"github.com/lni/dragonboat/v3/logger"
 	pb "github.com/lni/dragonboat/v3/raftpb"
 	sm "github.com/lni/dragonboat/v3/statemachine"
-	"github.com/lni/goutils/random"
 )
 
 func benchmarkAllocs(b *testing.B, sz uint64) {
@@ -132,13 +129,13 @@ func benchmarkProposeN(b *testing.B, sz int) {
 	total := uint64(0)
 	q := newEntryQueue(2048, 0)
 	cfg := config.Config{ClusterID: 1, NodeID: 1}
-	pp := newPendingProposal(cfg, p, q, "localhost:9090", 200)
+	pp := newPendingProposal(cfg, false, p, q, "localhost:9090")
 	session := client.NewNoOPSession(1, random.LockGuardedRand)
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			v := atomic.AddUint64(&total, 1)
 			b.SetBytes(int64(sz))
-			rs, err := pp.propose(session, data, nil, time.Second)
+			rs, err := pp.propose(session, data, 100)
 			if err != nil {
 				b.Errorf("%v", err)
 			}
@@ -176,7 +173,7 @@ func BenchmarkPendingProposalNextKey(b *testing.B) {
 	}
 	q := newEntryQueue(2048, 0)
 	cfg := config.Config{ClusterID: 1, NodeID: 1}
-	pp := newPendingProposal(cfg, p, q, "localhost:9090", 200)
+	pp := newPendingProposal(cfg, false, p, q, "localhost:9090")
 	b.RunParallel(func(pb *testing.PB) {
 		clientID := rand.Uint64()
 		for pb.Next() {
@@ -196,11 +193,11 @@ func BenchmarkReadIndexRead(b *testing.B) {
 	}
 	total := uint64(0)
 	q := newReadIndexQueue(2048)
-	pri := newPendingReadIndex(p, q, 200)
+	pri := newPendingReadIndex(p, q)
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			v := atomic.AddUint64(&total, 1)
-			rs, err := pri.read(nil, time.Second)
+			rs, err := pri.read(100)
 			if err != nil {
 				b.Errorf("%v", err)
 			}
@@ -275,7 +272,7 @@ func BenchmarkFSyncLatency(b *testing.B) {
 	b.StopTimer()
 	l := logger.GetLogger("logdb")
 	l.SetLevel(logger.WARNING)
-	db := getNewTestDB("db", "lldb")
+	db := getNewTestDB("db", "lldb", vfs.DefaultFS)
 	defer os.RemoveAll(rdbTestDirectory)
 	defer db.Close()
 	e := pb.Entry{
@@ -308,7 +305,7 @@ func benchmarkSaveRaftState(b *testing.B, sz int) {
 	b.StopTimer()
 	l := logger.GetLogger("logdb")
 	l.SetLevel(logger.WARNING)
-	db := getNewTestDB("db", "lldb")
+	db := getNewTestDB("db", "lldb", vfs.DefaultFS)
 	defer os.RemoveAll(rdbTestDirectory)
 	defer db.Close()
 	clusterID := uint64(1)
@@ -391,6 +388,11 @@ func (h *benchmarkMessageHandler) HandleSnapshot(clusterID uint64,
 	nodeID uint64, from uint64) {
 }
 
+type dummyTransportEvent struct{}
+
+func (d *dummyTransportEvent) ConnectionEstablished(addr string, snapshot bool) {}
+func (d *dummyTransportEvent) ConnectionFailed(addr string, snapshot bool)      {}
+
 func benchmarkTransport(b *testing.B, sz int) {
 	b.ReportAllocs()
 	b.StopTimer()
@@ -402,31 +404,31 @@ func benchmarkTransport(b *testing.B, sz int) {
 	addr2 := "localhost:43568"
 	nhc1 := config.NodeHostConfig{
 		RaftAddress: addr1,
+		FS:          vfs.DefaultFS,
 	}
-	ctx1, err := server.NewContext(nhc1)
+	ctx1, err := server.NewContext(nhc1, vfs.DefaultFS)
 	if err != nil {
 		b.Fatalf("failed to new context %v", err)
 	}
 	nhc2 := config.NodeHostConfig{
 		RaftAddress: addr2,
+		FS:          vfs.DefaultFS,
 	}
-	ctx2, err := server.NewContext(nhc2)
+	ctx2, err := server.NewContext(nhc2, vfs.DefaultFS)
 	if err != nil {
 		b.Fatalf("failed to new context %v", err)
 	}
 	nodes1 := transport.NewNodes(settings.Soft.StreamConnections)
 	nodes2 := transport.NewNodes(settings.Soft.StreamConnections)
-	nodes1.AddRemoteAddress(1, 2, addr2)
-	t1, err := transport.NewTransport(nhc1, ctx1, nodes1, nil)
+	nodes1.AddRemote(1, 2, addr2)
+	t1, err := transport.NewTransport(nhc1, ctx1, nodes1, nil, &dummyTransportEvent{}, vfs.DefaultFS)
 	if err != nil {
 		b.Fatalf("failed to create transport %v", err)
 	}
-	t1.SetUnmanagedDeploymentID()
-	t2, err := transport.NewTransport(nhc2, ctx2, nodes2, nil)
+	t2, err := transport.NewTransport(nhc2, ctx2, nodes2, nil, &dummyTransportEvent{}, vfs.DefaultFS)
 	if err != nil {
 		b.Fatalf("failed to create transport %v", err)
 	}
-	t2.SetUnmanagedDeploymentID()
 	defer t2.Stop()
 	defer t1.Stop()
 	handler1 := &benchmarkMessageHandler{
@@ -470,7 +472,7 @@ func benchmarkTransport(b *testing.B, sz int) {
 	for i := 0; i < b.N; i++ {
 		handler1.reset()
 		for _, msg := range msgs {
-			t1.ASyncSend(msg)
+			t1.Send(msg)
 		}
 		handler1.wait()
 	}
@@ -493,7 +495,8 @@ func BenchmarkLookup(b *testing.B) {
 	b.StopTimer()
 	ds := &tests.NoOP{}
 	done := make(chan struct{})
-	nds := rsm.NewNativeSM(1, 1, rsm.NewRegularStateMachine(ds), done)
+	config := config.Config{ClusterID: 1, NodeID: 1}
+	nds := rsm.NewNativeSM(config, rsm.NewRegularStateMachine(ds), done)
 	input := make([]byte, 1)
 	b.StartTimer()
 	for i := 0; i < b.N; i++ {
@@ -512,7 +515,8 @@ func BenchmarkNALookup(b *testing.B) {
 	b.StopTimer()
 	ds := &tests.NoOP{}
 	done := make(chan struct{})
-	nds := rsm.NewNativeSM(1, 1, rsm.NewRegularStateMachine(ds), done)
+	config := config.Config{ClusterID: 1, NodeID: 1}
+	nds := rsm.NewNativeSM(config, rsm.NewRegularStateMachine(ds), done)
 	input := make([]byte, 1)
 	b.StartTimer()
 	for i := 0; i < b.N; i++ {
@@ -531,8 +535,9 @@ func benchmarkStateMachineStep(b *testing.B, sz int, noopSession bool) {
 	b.StopTimer()
 	ds := &tests.NoOP{NoAlloc: true}
 	done := make(chan struct{})
-	nds := rsm.NewNativeSM(1, 1, rsm.NewRegularStateMachine(ds), done)
-	smo := rsm.NewStateMachine(nds, nil, config.Config{}, &testDummyNodeProxy{})
+	config := config.Config{ClusterID: 1, NodeID: 1}
+	nds := rsm.NewNativeSM(config, rsm.NewRegularStateMachine(ds), done)
+	smo := rsm.NewStateMachine(nds, nil, config, &testDummyNodeProxy{}, vfs.DefaultFS)
 	idx := uint64(0)
 	var s *client.Session
 	if noopSession {
@@ -611,12 +616,12 @@ func BenchmarkStateMachineStep1024(b *testing.B) {
 
 type noopSink struct{}
 
-func (n *noopSink) Receive(pb.SnapshotChunk) (bool, bool) { return true, false }
-func (n *noopSink) Stop()                                 {}
-func (n *noopSink) ClusterID() uint64                     { return 1 }
-func (n *noopSink) ToNodeID() uint64                      { return 1 }
+func (n *noopSink) Receive(pb.Chunk) (bool, bool) { return true, false }
+func (n *noopSink) Stop()                         {}
+func (n *noopSink) ClusterID() uint64             { return 1 }
+func (n *noopSink) ToNodeID() uint64              { return 1 }
 
-func BenchmarkSnapshotChunkWriter(b *testing.B) {
+func BenchmarkChunkWriter(b *testing.B) {
 	sink := &noopSink{}
 	meta := &rsm.SSMeta{}
 	cw := rsm.NewChunkWriter(sink, meta)
@@ -633,7 +638,7 @@ func BenchmarkSnapshotChunkWriter(b *testing.B) {
 	}
 }
 
-func BenchmarkSnappyCompressedSnapshotChunkWriter(b *testing.B) {
+func BenchmarkSnappyCompressedChunkWriter(b *testing.B) {
 	sink := &noopSink{}
 	meta := &rsm.SSMeta{}
 	cw := rsm.NewChunkWriter(sink, meta)

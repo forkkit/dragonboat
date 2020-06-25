@@ -36,11 +36,9 @@ const (
 //
 // {
 //   "GetConnectedTimeoutSecond": 15,
-//   "UnknownRegionName": "no-idea-region"
 // }
 //
 // soft.GetConnectedTimeoutSecond will be 15,
-// soft.UnknownRegionName will be "no-idea-region"
 //
 // The application need to be restarted to apply such configuration changes.
 //
@@ -50,12 +48,6 @@ const (
 var Soft = getSoftSettings()
 
 type soft struct {
-	// LocalRaftRequestTimeoutMs is the raft request timeout in millisecond.
-	LocalRaftRequestTimeoutMs uint64
-	// GetConnectedTimeoutSecond is the default timeout value in second when
-	// trying to connect to a gRPC based server.
-	GetConnectedTimeoutSecond uint64
-
 	//
 	// Raft
 	//
@@ -79,6 +71,9 @@ type soft struct {
 	// Multiraft
 	//
 
+	// PendingProposalShards defines the number of shards for the pending
+	// proposal data structure.
+	PendingProposalShards uint64
 	// SyncTaskInterval defines the interval in millisecond of periodic sync
 	// state machine task.
 	SyncTaskInterval uint64
@@ -88,9 +83,6 @@ type soft struct {
 	// IncomingProposalQueueLength defines the number of pending proposals
 	// allowed for each raft group.
 	IncomingProposalQueueLength uint64
-	// UnknownRegionName defines the region name to use when the region
-	// is unknown.
-	UnknownRegionName string
 	// ReceiveQueueLength is the length of the receive queue on each node.
 	ReceiveQueueLength uint64
 	// SnapshotStatusPushDelayMS is the number of millisecond delays we impose
@@ -102,17 +94,14 @@ type soft struct {
 	TaskQueueTargetLength uint64
 	// TaskQueueInitialCap defines the initial capcity of a task queue.
 	TaskQueueInitialCap uint64
-	// NodeHostSyncPoolSize defines the number of sync pools.
-	NodeHostSyncPoolSize uint64
-	// LatencySampleRatio defines the ratio how often latency is sampled.
-	// It samples roughly every LatencySampleRatio ops.
-	LatencySampleRatio uint64
+	// NodeHostRequestStatePoolShards defines the number of sync pools.
+	NodeHostRequestStatePoolShards uint64
 	// LazyFreeCycle defines how often should entry queue and message queue
 	// to be freed.
 	LazyFreeCycle uint64
 	// PanicOnSizeMismatch defines whether dragonboat should panic when snapshot
 	// file size doesn't match the size recorded in snapshot metadata.
-	PanicOnSizeMismatch uint64
+	PanicOnSizeMismatch bool
 
 	//
 	// RSM
@@ -128,6 +117,9 @@ type soft struct {
 	// NodeReloadMillisecond defines how often step engine should reload
 	// nodes, it is defined in number of millisecond.
 	NodeReloadMillisecond uint64
+	// StepEngineCommitWorkerCountis the number of workers to use to notify
+	// committed proposals.
+	StepEngineCommitWorkerCount uint64
 	// StepEngineTaskWorkerCount is the number of workers to use to apply
 	// proposals (processing committed proposals) to application state
 	// machines.
@@ -140,6 +132,9 @@ type soft struct {
 	// transport
 	//
 
+	// GetConnectedTimeoutSecond is the default timeout value in second when
+	// trying to connect to a gRPC based server.
+	GetConnectedTimeoutSecond uint64
 	// MaxSnapshotConnections defines the max number of concurrent outgoing
 	// snapshot connections.
 	MaxSnapshotConnections uint64
@@ -150,12 +145,6 @@ type soft struct {
 	// exchanged between nodehosts. You may need to increase this value when
 	// you want to host large number nodes per nodehost.
 	SendQueueLength uint64
-	// MaxDrummerServerMsgSize is the max size of messages sent/received on
-	// the Drummer side.
-	MaxDrummerServerMsgSize uint64
-	// MaxDrummerClientMsgSize is the max size of messages sent/received on
-	// the nodehost side.
-	MaxDrummerClientMsgSize uint64
 	// StreamConnections defines how many connections to use for each remote
 	// nodehost whene exchanging raft messages
 	StreamConnections uint64
@@ -172,45 +161,16 @@ type soft struct {
 	SnapshotChunkTimeoutTick uint64
 
 	//
-	// Drummer/node scheduling
-	//
-
-	// DrummerClientName defines the name of the built-in drummer client.
-	DrummerClientName string
-	// NodeHostInfoReportSecond defines how often in seconds nodehost report it
-	// details to Drummer servers.
-	NodeHostInfoReportSecond uint64
-	// NodeHostTTL defines the number of seconds without any report from the
-	// nodehost required to consider it as dead.
-	NodeHostTTL uint64
-	// NodeToStartMaxWait is the number of seconds allowed for a new node to stay
-	// in the to start state. To start state is the stage when a node has been
-	// added to the raft cluster but has not been confirmed to be launched and
-	// running on its assigned nodehost.
-	NodeToStartMaxWait uint64
-	// DrummerLoopIntervalFactor defines how often Drummer need to examine all
-	// NodeHost info reported to it measured by the number of nodehost info
-	// report cycles.
-	DrummerLoopIntervalFactor uint64
-	// PersisentLogReportCycle defines how often local persisted log info need
-	// to be reported to Drummer server. Each NodeHostInfoReportSecond is called
-	// a cycle. PersisentLogReportCycle defines how often each nodehost need to
-	// update Drummer servers in terms of NodeHostInfoReportSecond cycles.
-	PersisentLogReportCycle uint64
-
-	//
 	// LogDB
 	//
-	// RDBKeepLogFileNum defines how many log files to keep.
-	RDBKeepLogFileNum uint64
-	// RDBMaxBackgroundCompactions is the MaxBackgroundCompactions parameter
-	// directly passed to rocksdb.
-	RDBMaxBackgroundCompactions uint64
-	// RDBMaxBackgroundFlushes is the MaxBackgroundFlushes parameter directly
-	// passed to rocksdb.
-	RDBMaxBackgroundFlushes uint64
-	// RDBLRUCacheSize is the LRUCacheSize
-	RDBLRUCacheSize uint64
+	KVTolerateCorruptedTailRecords bool
+	// KVUseUniversalCompaction defines whether to use universal compaction to
+	// reduce write amplification. This setting is default to false, change it to
+	// true for existing system might cause unexpected consequences, please check
+	// the documentation of your KV store for more details.
+	//
+	// KVUseUniversalCompaction support is experimental - it is not fully tested.
+	KVUseUniversalCompaction bool
 }
 
 func getSoftSettings() soft {
@@ -220,16 +180,13 @@ func getSoftSettings() soft {
 }
 
 func getDefaultSoftSettings() soft {
-	NodeHostInfoReportSecond := uint64(20)
 	return soft{
 		MaxConcurrentStreamingSnapshot: 128,
 		MaxSnapshotConnections:         64,
 		SyncTaskInterval:               180000,
-		PanicOnSizeMismatch:            1,
+		PanicOnSizeMismatch:            true,
 		LazyFreeCycle:                  1,
-		LatencySampleRatio:             0,
 		BatchedEntryApply:              true,
-		LocalRaftRequestTimeoutMs:      10000,
 		GetConnectedTimeoutSecond:      5,
 		MaxEntrySize:                   MaxMessageBatchSize,
 		InMemGCTimeout:                 100,
@@ -237,33 +194,24 @@ func getDefaultSoftSettings() soft {
 		MinEntrySliceFreeSize:          96,
 		IncomingReadIndexQueueLength:   4096,
 		IncomingProposalQueueLength:    2048,
-		UnknownRegionName:              "UNKNOWN",
 		SnapshotStatusPushDelayMS:      1000,
+		PendingProposalShards:          16,
 		TaskQueueInitialCap:            64,
 		TaskQueueTargetLength:          1024,
-		NodeHostSyncPoolSize:           8,
+		NodeHostRequestStatePoolShards: 8,
 		TaskBatchSize:                  512,
 		NodeReloadMillisecond:          200,
+		StepEngineCommitWorkerCount:    16,
 		StepEngineTaskWorkerCount:      16,
 		StepEngineSnapshotWorkerCount:  64,
 		SendQueueLength:                1024 * 2,
 		ReceiveQueueLength:             1024,
-		MaxDrummerServerMsgSize:        256 * 1024 * 1024,
-		MaxDrummerClientMsgSize:        256 * 1024 * 1024,
 		StreamConnections:              4,
-		PerConnectionSendBufSize:       LargeEntitySize,
+		PerConnectionSendBufSize:       2 * 1024 * 1024,
 		PerConnectionRecvBufSize:       2 * 1024 * 1024,
 		SnapshotGCTick:                 30,
 		SnapshotChunkTimeoutTick:       900,
-		DrummerClientName:              "drummer-client",
-		NodeHostInfoReportSecond:       NodeHostInfoReportSecond,
-		NodeHostTTL:                    NodeHostInfoReportSecond * 3,
-		NodeToStartMaxWait:             NodeHostInfoReportSecond * 12,
-		DrummerLoopIntervalFactor:      1,
-		PersisentLogReportCycle:        3,
-		RDBMaxBackgroundCompactions:    2,
-		RDBMaxBackgroundFlushes:        2,
-		RDBLRUCacheSize:                0,
-		RDBKeepLogFileNum:              16,
+		KVTolerateCorruptedTailRecords: true,
+		KVUseUniversalCompaction:       false,
 	}
 }

@@ -55,13 +55,15 @@ enum MessageType {
 enum EntryType {
 	ApplicationEntry  = 0;
 	ConfigChangeEntry = 1;
-  EncodedEntry = 2;
+    EncodedEntry      = 2;
+	MetadataEntry     = 3;
 }
 
 enum ConfigChangeType {
 	AddNode     = 0;
   RemoveNode  = 1;
   AddObserver = 2;
+  AddWitness = 3;
 }
 
 enum StateMachineType {
@@ -121,6 +123,7 @@ message Membership {
   map<uint64, string> addresses   = 2;
   map<uint64, bool> removed       = 3;
   map<uint64, string> observers   = 4;
+  map<uint64, string> witnesses   = 5;
 }
 
 // field id 1 was used for optional string filename
@@ -145,6 +148,7 @@ message Snapshot {
   optional StateMachineType type  = 11 [(gogoproto.nullable) = false];
   optional bool imported          = 12 [(gogoproto.nullable) = false];
   optional uint64 on_disk_index   = 13 [(gogoproto.nullable) = false];
+  optional bool witness           = 14 [(gogoproto.nullable) = false];
 }
 
 message Message {
@@ -199,7 +203,7 @@ message MessageBatch {
 }
 
 // field id 11 was used for optional string filename
-message SnapshotChunk {
+message Chunk {
   optional uint64 cluster_id        = 1 [(gogoproto.nullable) = false];
   optional uint64 node_id           = 2 [(gogoproto.nullable) = false];
   optional uint64 from              = 3 [(gogoproto.nullable) = false];
@@ -219,4 +223,5 @@ message SnapshotChunk {
   optional SnapshotFile file_info  = 18 [(gogoproto.nullable) = false];
   optional uint32 bin_ver          = 19 [(gogoproto.nullable) = false];
   optional uint64 on_disk_index    = 20 [(gogoproto.nullable) = false];
+  optional bool witness            = 21 [(gogoproto.nullable) = false]; 
 }

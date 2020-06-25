@@ -81,6 +81,16 @@ const (
 	FatalInfoLogLevel = InfoLogLevel(4)
 )
 
+type WALRecoveryMode int
+
+// Recovery mode
+const (
+	TolerateCorruptedTailRecords = WALRecoveryMode(C.rocksdb_tolerate_corrupted_tail_records_recovery)
+	AbsoluteConsistency          = WALRecoveryMode(C.rocksdb_absolute_consistency_recovery)
+	PointInTime                  = WALRecoveryMode(C.rocksdb_point_in_time_recovery)
+	SkipAnyCorruptedRecords      = WALRecoveryMode(C.rocksdb_skip_any_corrupted_records_recovery)
+)
+
 // Options represent all of the available options when opening a database with Open.
 type Options struct {
 	c *C.rocksdb_options_t
@@ -486,6 +496,12 @@ func (opts *Options) SetMaxBytesForLevelMultiplierAdditional(value []int) {
 	}
 
 	C.rocksdb_options_set_max_bytes_for_level_multiplier_additional(opts.c, &cLevels[0], C.size_t(len(value)))
+}
+
+// SetLevelCompactionDynamicLevelBytes enables/disables the
+// level_compaction_dynamic_level_bytes option field.
+func (opts *Options) SetLevelCompactionDynamicLevelBytes(value bool) {
+	C.rocksdb_options_set_level_compaction_dynamic_level_bytes(opts.c, boolToChar(value))
 }
 
 // SetUseFsync enable/disable fsync.
@@ -945,6 +961,11 @@ func (opts *Options) SetBlockBasedTableFactory(value *BlockBasedTableOptions) {
 	C.rocksdb_options_set_block_based_table_factory(opts.c, value.c)
 }
 
+// SetRecycleLogFileNum sets the recycle_log_file_num option field.
+func (opts *Options) SetRecycleLogFileNum(value int) {
+	C.rocksdb_options_set_recycle_log_file_num(opts.c, C.size_t(value))
+}
+
 // Destroy deallocates the Options object.
 func (opts *Options) Destroy() {
 	C.rocksdb_options_destroy(opts.c)
@@ -960,4 +981,9 @@ func (opts *Options) Destroy() {
 	opts.c = nil
 	opts.env = nil
 	opts.bbto = nil
+}
+
+// SetWALRecoveryMode sets the wal recovery mode.
+func (opts *Options) SetWALRecoveryMode(mode WALRecoveryMode) {
+	C.rocksdb_options_set_wal_recovery_mode(opts.c, C.int(mode))
 }

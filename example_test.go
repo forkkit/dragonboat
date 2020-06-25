@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build !dragonboat_slowtest
-// +build !dragonboat_errorinjectiontest
-
 package dragonboat
 
 import (
@@ -100,12 +97,12 @@ func ExampleNodeHost_Propose() {
 		// failed to start the proposal
 		return
 	}
-	s := <-rs.CompletedC
+	s := <-rs.ResultC()
 	if s.Timeout() {
 		// the proposal failed to complete before the deadline, maybe retry the
 		// request
 	} else if s.Completed() {
-		// Release can only be called when the CompletedC chan has been signalled.
+		// Release can only be called when the ResultC() chan has been signalled.
 		rs.Release()
 		// the proposal has been committed and applied
 		// put the request state instance back to the recycle pool
@@ -126,7 +123,7 @@ func ExampleNodeHost_ReadIndex() {
 		// ReadIndex failed to start
 		return
 	}
-	s := <-rs.CompletedC
+	s := <-rs.ResultC()
 	if s.Timeout() {
 		// the ReadIndex operation failed to complete before the deadline, maybe
 		// retry the request
@@ -158,7 +155,7 @@ func ExampleNodeHost_RequestDeleteNode() {
 		// failed to start the membership change request
 		return
 	}
-	s := <-rs.CompletedC
+	s := <-rs.ResultC()
 	if s.Timeout() {
 		// the request failed to complete before the deadline, maybe retry the
 		// request
@@ -188,7 +185,7 @@ func ExampleNodeHost_RequestAddNode() {
 		// failed to start the membership change request
 		return
 	}
-	s := <-rs.CompletedC
+	s := <-rs.ResultC()
 	if s.Timeout() {
 		// the request failed to complete before the deadline, maybe retry the
 		// request
@@ -245,7 +242,7 @@ func ExampleNodeHost_SyncGetSession() {
 		// failed to start the proposal
 		return
 	}
-	s := <-rs.CompletedC
+	s := <-rs.ResultC()
 	if s.Timeout() {
 		// the proposal failed to complete before the deadline. maybe retry
 		// the request with the same client session instance s.

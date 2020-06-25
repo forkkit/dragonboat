@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -45,7 +45,7 @@ snapshotted to disks. CPU, disk bandwidth and disk space overheads are thus
 introduced for generating and storing such periodic snapshots.
 
 For IOnDiskStateMachine based application state machine, the major difference is
-that the state machine state is persisted on disk so it can surivive reboot
+that the state machine state is persisted on disk so it can survive reboot
 without reconstruction from saved snapshots and Raft Logs. As the state is
 mostly persisted on disk by design, there is no need to periodically save the
 entire state to disk again as full snapshots. A full snapshot is only generated
@@ -58,9 +58,9 @@ the user implementation to correctly and safely maintain its internal data
 structures during such concurrent accesses. IOnDiskStateMachine is basically the
 on disk state machine type described in the section 5.2 of the Raft thesis.
 
-When you are not sure whether to IStateMachine or IOnDiskStateMachine in your
-project, the rule of thumb is to implement IStateMachine first and upgrade it
-to an IOnDiskStateMachine later when necessary.
+When you are not sure whether to use IStateMachine or IOnDiskStateMachine in
+your project, the rule of thumb is to implement IStateMachine first and upgrade
+it to an IOnDiskStateMachine later when necessary.
 
 IConcurrentStateMachine is another supported state machine interface, it aims to
 represent in memory state machine with concurrent read and write capabilities.
@@ -73,11 +73,13 @@ import (
 )
 
 var (
-	// ErrSnapshotStopped is returned by the SaveSnapshot and RecoverFromSnapshot
-	// methods of the IStateMachine interface to indicate that those two snapshot
-	// related operations have been aborted as the associated raft node is being
-	// closed.
+	// ErrSnapshotStopped is returned by state machine's SaveSnapshot and
+	// RecoverFromSnapshot methods to indicate that those two snapshot operations
+	// have been aborted as the associated raft node is being closed.
 	ErrSnapshotStopped = errors.New("snapshot stopped")
+	// ErrSnapshotAborted is returned by state machine's SaveSnapshot method to
+	// indicate that the SaveSnapshot operation is aborted by the user.
+	ErrSnapshotAborted = errors.New("snapshot aborted")
 )
 
 // Type is the state machine type.
@@ -232,11 +234,14 @@ type IStateMachine interface {
 	// can choose to abort the SaveSnapshot procedure and return
 	// ErrSnapshotStopped immediately.
 	//
+	// SaveSnapshot is allowed to abort the snapshotting operation at any time by
+	// returning ErrSnapshotAborted.
+	//
 	// SaveSnapshot returns the encountered error when generating the snapshot.
-	// Other than the above mentioned ErrSnapshotStopped error, the IStateMachine
-	// implementation should only return a non-nil error when the system need to
-	// be immediately halted for critical errors, e.g. disk error preventing you
-	// from saving the snapshot.
+	// Other than the above mentioned ErrSnapshotStopped and ErrSnapshotAborted
+	// errors, the IStateMachine implementation should only return a non-nil error
+	// when the system need to be immediately halted for critical errors, e.g.
+	// disk error preventing you from saving the snapshot.
 	SaveSnapshot(io.Writer, ISnapshotFileCollection, <-chan struct{}) error
 	// RecoverFromSnapshot recovers the state of the IStateMachine object from a
 	// previously saved snapshot captured by the SaveSnapshot method. The saved

@@ -24,10 +24,10 @@ const (
 	updateSliceLen = 256
 )
 
-// rdbcontext is an IContext implementation suppose to be owned and used
+// rdbContext is an IContext implementation suppose to be owned and used
 // by a single thread throughout its life time.
-type rdbcontext struct {
-	valSize uint64
+type rdbContext struct {
+	size    uint64
 	eb      pb.EntryBatch
 	lb      pb.EntryBatch
 	key     *PooledKey
@@ -37,11 +37,11 @@ type rdbcontext struct {
 }
 
 // newRDBContext creates a new RDB context instance.
-func newRDBContext(valSize uint64, wb kv.IWriteBatch) *rdbcontext {
-	ctx := &rdbcontext{
-		valSize: valSize,
+func newRDBContext(size uint64, wb kv.IWriteBatch) *rdbContext {
+	ctx := &rdbContext{
+		size:    size,
 		key:     newKey(maxKeySize, nil),
-		val:     make([]byte, valSize),
+		val:     make([]byte, size),
 		updates: make([]pb.Update, 0, updateSliceLen),
 		wb:      wb,
 	}
@@ -50,41 +50,46 @@ func newRDBContext(valSize uint64, wb kv.IWriteBatch) *rdbcontext {
 	return ctx
 }
 
-func (c *rdbcontext) Destroy() {
+func (c *rdbContext) Destroy() {
 	if c.wb != nil {
 		c.wb.Destroy()
 	}
 }
 
-func (c *rdbcontext) Reset() {
+func (c *rdbContext) Reset() {
 	if c.wb != nil {
 		c.wb.Clear()
 	}
 }
 
-func (c *rdbcontext) GetKey() raftio.IReusableKey {
+func (c *rdbContext) GetKey() raftio.IReusableKey {
 	return c.key
 }
 
-func (c *rdbcontext) GetValueBuffer(sz uint64) []byte {
-	if sz <= c.valSize {
+func (c *rdbContext) GetValueBuffer(sz uint64) []byte {
+	if sz <= c.size {
 		return c.val
 	}
-	return make([]byte, sz)
+	val := make([]byte, sz)
+	if sz < RDBContextValueSize {
+		c.size = sz
+		c.val = val
+	}
+	return val
 }
 
-func (c *rdbcontext) GetUpdates() []pb.Update {
+func (c *rdbContext) GetUpdates() []pb.Update {
 	return c.updates
 }
 
-func (c *rdbcontext) GetEntryBatch() pb.EntryBatch {
+func (c *rdbContext) GetEntryBatch() pb.EntryBatch {
 	return c.eb
 }
 
-func (c *rdbcontext) GetLastEntryBatch() pb.EntryBatch {
+func (c *rdbContext) GetLastEntryBatch() pb.EntryBatch {
 	return c.lb
 }
 
-func (c *rdbcontext) GetWriteBatch() interface{} {
+func (c *rdbContext) GetWriteBatch() interface{} {
 	return c.wb
 }

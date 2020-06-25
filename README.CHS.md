@@ -8,19 +8,20 @@
 [![Join the chat at https://gitter.im/lni/dragonboat](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/lni/dragonboat?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 
 ## 项目新闻 ##
+* 2020-03-05 Dragonboat v3.2 已发布，请查看[CHANGELOG](CHANGELOG.md)获知详情。
 * 2019-07-04 Dragonboat v3.1 已发布，请在升级前仔细阅读[CHANGELOG](CHANGELOG.md)。
 * 2019-06-21 Dragonboat v3.0 已发布，新增基于磁盘的状态机和Go module支持，详见([CHANGELOG](CHANGELOG.md))。
 * 2019-02-20 Dragonboat v2.1 已发布。
 
 ## 关于 ##
-Dragonboat是一个高性能[Go](https://golang.org)实现的多组[Raft](https://raft.github.io/) [共识算法](https://en.wikipedia.org/wiki/Consensus_(computer_science))库，它同时提供[C++11](/binding)支持。
+Dragonboat是一个高性能[Go](https://golang.org)实现的多组[Raft](https://raft.github.io/) [共识算法](https://en.wikipedia.org/wiki/Consensus_(computer_science))库。
 
 Raft这样的共识算法使得只要系统中的多数成员在线便可使得系统持续运行。比如，一个拥有5台服务器的Raft集群中即使有两台服务器故障依旧可以工作。它同时向客户端展现一个单机节点，始终提供强一致保证的数据访存。同时，所有在线的成员节点都可用来提供读操作，从而提供更高的读吞吐总和。
 
 所有Raft相关的技术难点都会由Dragonboat来承担，用户从而可以只关注他们各自的应用领域。Dragonboats[使用十分简便](docs/overview.CHS.md)，详细的[例程](https://github.com/lni/dragonboat-example)可使新用户在半小时内完全掌握它。
 
 ## 功能 ##
-* 便于使用的可构建单组与多组Raft应用的Go和C++ API
+* 便于使用的可构建单组与多组Raft应用的API
 * 功能完备的多组Raft协议的实现，同机支持数千Raft组
 * 完备的测试确保[正确性](/docs/test.md)，这包括[Jepsen](https://aphyr.com/tags/jepsen)所带的[Knossos](https://github.com/jepsen-io/knossos)强一致性检查，部分测试日志[在此](https://github.com/lni/knossos-data)
 * 全流水线设计、TLS支持，适合被部署于跨地域的高网络延时公网环境
@@ -36,6 +37,7 @@ Diego Ongaro的[Raft博士学位论文](https://ramcloud.stanford.edu/~ongaro/th
 * 基于ReadIndex协议的只读查询
 * 主节点转移
 * 无投票权成员
+* Witness成员
 * 应用透明的幂等更新支持
 * 成组处理优化与流水化处理
 * 基于磁盘的状态机
@@ -43,7 +45,7 @@ Diego Ongaro的[Raft博士学位论文](https://ramcloud.stanford.edu/~ongaro/th
 ## 性能 ##
 Dragonboat是目前Github网站上最快的开源多组Raft实现。
 
-在三节点系统上，使用中端硬件（具体信息[在此](/docs/test.md)）与基于内存的状态机，在16字节的荷载下，Dragonboat可持续每秒900万次写或在9:1的高读写比场景下提供每秒1100万次的混合读写操作。高吞吐在跨地域分布环境依旧被保持，在使用更多的clients的情况下，在RTT为30ms时依旧能实现200万次每秒的IO操作。
+在三节点系统上，使用中端硬件（具体信息[在此](/docs/test.md)）与基于内存的状态机，在16字节的荷载下，当使用RocksDB做为存储引擎，Dragonboat可持续每秒900万次写或在9:1的高读写比场景下提供每秒1100万次的混合读写操作。高吞吐在跨地域分布环境依旧被保持，在使用更多的clients的情况下，在RTT为30ms时依旧能实现200万次每秒的IO操作。
 ![throughput](./docs/throughput.png)
 
 每个服务器上可轻易承载数千Raft组。并发的活跃Raft组数量对吞吐有直接影响，而大量的闲置Raft组对系统性能并无巨大影响。
@@ -66,57 +68,24 @@ Dragonboat是目前Github网站上最快的开源多组Raft实现。
 ![stw](./docs/stw.png)
 
 ## 系统需求 ##
-* x86_64 Linux或MacOS, Go 1.13或1.12，支持C++11的近期版本GCC或Clang
-* [RocksDB](https://github.com/facebook/rocksdb/blob/master/INSTALL.md) 5.13.4或更新的版本
+* x86_64 Linux或MacOS, Go 1.14或1.13
 
 ## 开始使用 ##
-__Master是用于开发的非稳定branch。生产环境请使用已发布版本。__
+__Master是用于开发的非稳定branch。生产环境请使用已发布版本。__如您使用v3.2.x版本，请参考v3.2.x版本的[README.CHS.md](https://github.com/lni/dragonboat/blob/release-3.2/README.CHS.md)。
 
-首先请确保Go 1.12或者更新的版本已被安装以获得[Go module](https://github.com/golang/go/wiki/Modules)支持。
+首先请确保Go 1.13或者更新的版本已被安装以获得[Go module](https://github.com/golang/go/wiki/Modules)支持。
 
-请首先选择使用[RocksDB还是LevelDB](docs/storage.CHS.md)来存储Raft日志数据，建议使用RocksDB。
+请在Go程序中import __github.com/lni/dragonboat/v3__这个包，同时把"github.com/lni/dragonboat/v3 v3.2.0"添加到您的Go应用的go.mod文件的__require__部分。
 
-### 安装RocksDB ###
-如果RocksDB 5.13.4或者更新版本尚未安装，可按下列步骤安装。首先下载Dragonboat库至$HOME/src并将RocksDB安装到/usr/local/lib和/usr/local/include位置：
-```
-$ cd $HOME/src
-$ git clone https://github.com/lni/dragonboat
-$ cd $HOME/src/dragonboat
-$ make install-rocksdb-ull
-```
-运行下列命令检查安装是否正确：
-```
-$ cd $HOME/src/dragonboat
-$ GO111MODULE=on make dragonboat-test
-```
+[Pebble](https://github.com/cockroachdb/pebble)是默认的用于存储Raft Log的存储引擎。RocksDB与自定义存储引擎的使用方法可参考[这里](docs/storage.CHS.md)。
 
-请注意，如果RocksDB事先已经安装，上述步骤可直接跳过。如果您仅希望使用dragonboat库，至此可以安全的删除$HOME/src/dragonboat目录了。
-
-### 使用Dragonboat ###
-在您的应用中使用dragonboat库，请确保在Go程序代码中import __github.com/lni/dragonboat/v3__这个包，同时把"github.com/lni/dragonboat/v3 v3.1.0"添加到您的Go应用的go.mod文件的__require__部分。
-
-编译您的应用的时候，如有需要，可将RocksDB安装位置告知Go:
-```
-CGO_CFLAGS="-I/path/to/rocksdb/include" CGO_LDFLAGS="-L/path/to/rocksdb/lib -lrocksdb" go build -v pkgname
-```
-
-具体使用可可参考[示例](https://github.com/lni/dragonboat-example)。
-
-### LevelDB ###
-使用LevelDB无额外安装步骤。在应用中使用基于LevelDB的Raft log storage，需将您的config.NodeHostConfig的LogDBFactory项设为leveldb.NewLogDB这一在github.com/lni/dragonboat/plugin/leveldb包中提供的factory函数。
-
-编译应用时可用如下方法避免对RocksDB库的依赖:
-```
-go build -v -tags="dragonboat_no_rocksdb" pkgname
-```
+同时可参考[例程](https://github.com/lni/dragonboat-example)以了解更多Dragonboat使用信息。
 
 ## 文档与资料 ##
 
 首先建议您阅读项目的[综述文档](docs/overview.CHS.md)与[运维注意事项](docs/devops.CHS.md)。
 
 欢迎阅读[godoc文档](https://godoc.org/github.com/lni/dragonboat)，[中文例程](https://github.com/lni/dragonboat-example)，[常见问题](https://github.com/lni/dragonboat/wiki/FAQ)，[CHANGELOG](CHANGELOG.md)和在线[讨论组](https://gitter.im/lni/dragonboat)。
-
-C++ binding的信息可参考[这里](https://github.com/lni/dragonboat/blob/master/binding/README.md)。
 
 ## 中文例程 ##
 中文例程在[这里](https://github.com/lni/dragonboat-example)。

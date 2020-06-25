@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -125,11 +125,14 @@ type IConcurrentStateMachine interface {
 	// can choose to abort the SaveSnapshot procedure and return
 	// ErrSnapshotStopped immediately.
 	//
+	// SaveSnapshot is allowed to abort the snapshotting operation at any time by
+	// returning ErrSnapshotAborted.
+	//
 	// SaveSnapshot returns the encountered error when generating the snapshot.
-	// Other than the above mentioned ErrSnapshotStopped error, the
-	// IConcurrentStateMachine implementation should only return a non-nil error
-	// when the system need to be immediately halted for critical errors, e.g.
-	// disk error preventing you from saving the snapshot.
+	// Other than the above mentioned ErrSnapshotStopped and ErrSnapshotAborted
+	// errors, the IConcurrentStateMachine implementation should only return a
+	// non-nil error when the system need to be immediately halted for critical
+	// errors, e.g. disk error preventing you from saving the snapshot.
 	SaveSnapshot(interface{},
 		io.Writer, ISnapshotFileCollection, <-chan struct{}) error
 	// RecoverFromSnapshot recovers the state of the IConcurrentStateMachine

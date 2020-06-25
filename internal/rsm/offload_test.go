@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import (
 
 func TestOffloadedStatusReadyToDestroy(t *testing.T) {
 	o := OffloadedStatus{}
+	o.DestroyedC = make(chan struct{})
 	if o.ReadyToDestroy() {
 		t.Errorf("ready to destroy, not expected")
 	}
@@ -34,8 +35,10 @@ func TestOffloadedStatusReadyToDestroy(t *testing.T) {
 
 func TestOffloadedStatusAllOffloadedWillMakeItReadyToDestroy(t *testing.T) {
 	o := OffloadedStatus{}
+	o.DestroyedC = make(chan struct{})
 	o.SetOffloaded(FromStepWorker)
 	o.SetOffloaded(FromCommitWorker)
+	o.SetOffloaded(FromApplyWorker)
 	o.SetOffloaded(FromSnapshotWorker)
 	if o.ReadyToDestroy() {
 		t.Errorf("ready to destroy, not expected")
@@ -48,6 +51,7 @@ func TestOffloadedStatusAllOffloadedWillMakeItReadyToDestroy(t *testing.T) {
 
 func TestOffloadedStatusOffloadedFromNodeHostIsHandled(t *testing.T) {
 	o := OffloadedStatus{}
+	o.DestroyedC = make(chan struct{})
 	o.SetOffloaded(FromNodeHost)
 	if !o.ReadyToDestroy() {
 		t.Errorf("not ready to destroy, not expected")
@@ -65,5 +69,4 @@ func TestOffloadedStatusOffloadedFromNodeHostIsHandled(t *testing.T) {
 	if !o1.ReadyToDestroy() {
 		t.Errorf("not ready to destroy, not expected")
 	}
-
 }

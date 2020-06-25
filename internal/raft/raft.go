@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,13 +26,14 @@ import (
 	"math"
 	"sort"
 
+	"github.com/lni/goutils/logutil"
+	"github.com/lni/goutils/random"
+
 	"github.com/lni/dragonboat/v3/config"
 	"github.com/lni/dragonboat/v3/internal/server"
 	"github.com/lni/dragonboat/v3/internal/settings"
 	"github.com/lni/dragonboat/v3/logger"
 	pb "github.com/lni/dragonboat/v3/raftpb"
-	"github.com/lni/goutils/logutil"
-	"github.com/lni/goutils/random"
 )
 
 var (
@@ -65,6 +66,7 @@ const (
 	candidate
 	leader
 	observer
+	witness
 	numStates
 )
 
@@ -73,6 +75,7 @@ var stateNames = [...]string{
 	"Candidate",
 	"Leader",
 	"Observer",
+	"Witness",
 }
 
 func (st State) String() string {
@@ -137,10 +140,12 @@ func getLocalStatus(r *raft) Status {
 //  * ReadIndex protocol for read-only queries
 //  * leadership transfer
 //  * non-voting members
+//  * witness members
 //  * idempotent updates
 //  * quorum check
 //  * batching
 //  * pipelining
+//  * witness
 //
 // Features currently being worked on -
 //  * pre-vote
@@ -150,7 +155,7 @@ func getLocalStatus(r *raft) Status {
 // This implementation made references to etcd raft's design in the following
 // aspects:
 //  * it models the raft protocol state as a state machine
-//  * restricting to at most one pending leadership change at a time
+//  * restricting to at most one pending leadership change request at a time
 //  * replication flow control
 //
 // Copyright 2015 The etcd Authors
@@ -178,7 +183,7 @@ func getLocalStatus(r *raft) Status {
 // * zero disk read when replicating raft log entries
 // * committed entries are applied in a fully asynchronous manner
 // * snapshots are applied in a fully asynchronous manner
-// * replication messages can be serialized and sent in fully asynchronous manner
+// * replication messages can be asynchronously serialized and sent
 // * pagination support when applying committed entries
 // * making proposals are fully batched
 // * ReadIndex protocol implementation are fully batched
@@ -197,9 +202,10 @@ type raft struct {
 	term                      uint64
 	vote                      uint64
 	log                       *entryLog
-	rl                        *server.RateLimiter
+	rl                        *server.InMemRateLimiter
 	remotes                   map[uint64]*remote
 	observers                 map[uint64]*remote
+	witnesses                 map[uint64]*remote
 	state                     State
 	votes                     map[uint64]bool
 	msgs                      []pb.Message
@@ -233,7 +239,7 @@ func newRaft(c *config.Config, logdb ILogDB) *raft {
 	if logdb == nil {
 		panic("logdb is nil")
 	}
-	rl := server.NewRateLimiter(c.MaxInMemLogSize)
+	rl := server.NewInMemRateLimiter(c.MaxInMemLogSize)
 	r := &raft{
 		clusterID:        c.ClusterID,
 		nodeID:           c.NodeID,
@@ -243,6 +249,7 @@ func newRaft(c *config.Config, logdb ILogDB) *raft {
 		log:              newEntryLog(logdb, rl),
 		remotes:          make(map[uint64]*remote),
 		observers:        make(map[uint64]*remote),
+		witnesses:        make(map[uint64]*remote),
 		electionTimeout:  c.ElectionRTT,
 		heartbeatTimeout: c.HeartbeatRTT,
 		checkQuorum:      c.CheckQuorum,
@@ -253,22 +260,25 @@ func newRaft(c *config.Config, logdb ILogDB) *raft {
 		dn(r.clusterID, r.nodeID), r.rl.Enabled(), c.MaxInMemLogSize)
 	st, members := logdb.NodeState()
 	for p := range members.Addresses {
-		r.remotes[p] = &remote{
-			next: 1,
-		}
+		r.remotes[p] = &remote{next: 1}
 	}
 	for p := range members.Observers {
-		r.observers[p] = &remote{
-			next: 1,
-		}
+		r.observers[p] = &remote{next: 1}
+	}
+	for p := range members.Witnesses {
+		r.witnesses[p] = &remote{next: 1}
 	}
 	r.resetMatchValueArray()
 	if !pb.IsEmptyState(st) {
 		r.loadState(st)
 	}
+	// Set node initial state.
 	if c.IsObserver {
 		r.state = observer
 		r.becomeObserver(r.term, NoLeader)
+	} else if c.IsWitness {
+		r.state = witness
+		r.becomeWitness(r.term, NoLeader)
 	} else {
 		// see first paragraph section 5.2 of the raft paper
 		r.becomeFollower(r.term, NoLeader)
@@ -296,7 +306,7 @@ func (r *raft) getApplied() uint64 {
 }
 
 func (r *raft) resetMatchValueArray() {
-	r.matched = make([]uint64, len(r.remotes))
+	r.matched = make([]uint64, r.numVotingMembers())
 }
 
 func (r *raft) describe() string {
@@ -305,18 +315,31 @@ func (r *raft) describe() string {
 	if err != nil && err != ErrCompacted {
 		plog.Panicf("%s failed to get term, %v", dn(r.clusterID, r.nodeID), err)
 	}
-	fmtstr := "[f-idx:%d,l-idx:%d,logterm:%d,commit:%d,applied:%d] %s term %d"
+	// first, last, term, committed, applied
+	fmtstr := "[f:%d,l:%d,t:%d,c:%d,a:%d] %s t%d"
 	return fmt.Sprintf(fmtstr,
 		r.log.firstIndex(), r.log.lastIndex(), t, r.log.committed,
 		r.log.processed, dn(r.clusterID, r.nodeID), r.term)
+}
+
+func (r *raft) isCandidate() bool {
+	return r.state == candidate
+}
+
+func (r *raft) isLeader() bool {
+	return r.state == leader
 }
 
 func (r *raft) isObserver() bool {
 	return r.state == observer
 }
 
+func (r *raft) isWitness() bool {
+	return r.state == witness
+}
+
 func (r *raft) mustBeLeader() {
-	if r.state != leader {
+	if !r.isLeader() {
 		plog.Panicf("%s is not a leader", r.describe())
 	}
 }
@@ -335,15 +358,19 @@ func (r *raft) setLeaderID(leaderID uint64) {
 }
 
 func (r *raft) leaderTransfering() bool {
-	return r.leaderTransferTarget != NoNode && r.state == leader
+	return r.leaderTransferTarget != NoNode && r.isLeader()
 }
 
 func (r *raft) abortLeaderTransfer() {
 	r.leaderTransferTarget = NoNode
 }
 
+func (r *raft) numVotingMembers() int {
+	return len(r.remotes) + len(r.witnesses)
+}
+
 func (r *raft) quorum() int {
-	return len(r.remotes)/2 + 1
+	return r.numVotingMembers()/2 + 1
 }
 
 func (r *raft) isSingleNodeQuorum() bool {
@@ -352,24 +379,44 @@ func (r *raft) isSingleNodeQuorum() bool {
 
 func (r *raft) leaderHasQuorum() bool {
 	c := 0
-	for nid := range r.remotes {
-		if nid == r.nodeID || r.remotes[nid].isActive() {
+
+	for nid, member := range r.votingMembers() {
+		if nid == r.nodeID || member.isActive() {
 			c++
-			r.remotes[nid].setNotActive()
+			member.setNotActive()
 		}
 	}
 	return c >= r.quorum()
 }
 
 func (r *raft) nodes() []uint64 {
-	nodes := make([]uint64, 0, len(r.remotes)+len(r.observers))
+	nodes := make([]uint64, 0, r.numVotingMembers()+len(r.observers))
 	for id := range r.remotes {
 		nodes = append(nodes, id)
 	}
 	for id := range r.observers {
 		nodes = append(nodes, id)
 	}
+	for id := range r.witnesses {
+		nodes = append(nodes, id)
+	}
+	return nodes
+}
+
+func (r *raft) nodesSorted() []uint64 {
+	nodes := r.nodes()
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i] < nodes[j] })
+	return nodes
+}
+
+func (r *raft) votingMembers() map[uint64]*remote {
+	nodes := make(map[uint64]*remote, r.numVotingMembers())
+	for id, rm := range r.remotes {
+		nodes[id] = rm
+	}
+	for id, wt := range r.witnesses {
+		nodes[id] = wt
+	}
 	return nodes
 }
 
@@ -404,6 +451,14 @@ func (r *raft) restore(ss pb.Snapshot) bool {
 			}
 		}
 	}
+	if !r.isWitness() {
+		for nid := range ss.Membership.Witnesses {
+			if nid == r.nodeID {
+				plog.Panicf("%s converting to witness, index %d, committed %d, %+v",
+					r.describe(), ss.Index, r.log.committed, ss)
+			}
+		}
+	}
 	// p52 of the raft thesis
 	if r.log.matchTerm(ss.Index, ss.Term) {
 		// a snapshot at index X implies that X has been committed
@@ -419,8 +474,12 @@ func (r *raft) restore(ss pb.Snapshot) bool {
 func (r *raft) restoreRemotes(ss pb.Snapshot) {
 	r.remotes = make(map[uint64]*remote)
 	for id := range ss.Membership.Addresses {
-		if id == r.nodeID && r.state == observer {
+		if id == r.nodeID && r.isObserver() {
 			r.becomeFollower(r.term, r.leaderID)
+		}
+		_, ok := r.witnesses[id]
+		if ok {
+			plog.Panicf("Assumed witness could not promote to full member")
 		}
 		match := uint64(0)
 		next := r.log.lastIndex() + 1
@@ -431,7 +490,7 @@ func (r *raft) restoreRemotes(ss pb.Snapshot) {
 		plog.Infof("%s restored remote progress of %s [%s]",
 			r.describe(), NodeID(id), r.remotes[id])
 	}
-	if r.selfRemoved() && r.state == leader {
+	if r.selfRemoved() && r.isLeader() {
 		r.becomeFollower(r.term, NoLeader)
 	}
 	r.observers = make(map[uint64]*remote)
@@ -444,6 +503,17 @@ func (r *raft) restoreRemotes(ss pb.Snapshot) {
 		r.setObserver(id, match, next)
 		plog.Infof("%s restored observer progress of %s [%s]",
 			r.describe(), NodeID(id), r.observers[id])
+	}
+	r.witnesses = make(map[uint64]*remote)
+	for id := range ss.Membership.Witnesses {
+		match := uint64(0)
+		next := r.log.lastIndex() + 1
+		if id == r.nodeID {
+			match = next - 1
+		}
+		r.setWitness(id, match, next)
+		plog.Infof("%s restored witness progress of %s [%s]",
+			r.describe(), NodeID(id), r.witnesses[id])
 	}
 	r.resetMatchValueArray()
 }
@@ -488,7 +558,7 @@ func (r *raft) tick() {
 	if r.timeForInMemGC() {
 		r.log.inmem.tryResize()
 	}
-	if r.state == leader {
+	if r.isLeader() {
 		r.leaderTick()
 	} else {
 		r.nonLeaderTick()
@@ -496,19 +566,19 @@ func (r *raft) tick() {
 }
 
 func (r *raft) nonLeaderTick() {
-	if r.state == leader {
+	if r.isLeader() {
 		panic("noleader tick called on leader node")
 	}
 	r.electionTick++
 	if r.timeForRateLimitCheck() {
 		if r.rl.Enabled() {
-			r.rl.HeartbeatTick()
+			r.rl.Tick()
 			r.sendRateLimitMessage()
 		}
 	}
 	// section 4.2.1 of the raft thesis
-	// non-voting member is not to do anything related to election
-	if r.isObserver() {
+	// non-voting member or witness will not participate in election
+	if r.isObserver() || r.isWitness() {
 		return
 	}
 	// 6th paragraph section 5.2 of the raft paper
@@ -526,7 +596,7 @@ func (r *raft) leaderTick() {
 	r.electionTick++
 	if r.timeForRateLimitCheck() {
 		if r.rl.Enabled() {
-			r.rl.HeartbeatTick()
+			r.rl.Tick()
 		}
 	}
 	timeToAbortLeaderTransfer := r.timeToAbortLeaderTransfer()
@@ -590,7 +660,7 @@ func (r *raft) send(m pb.Message) {
 }
 
 func (r *raft) sendRateLimitMessage() {
-	if r.state == leader {
+	if r.isLeader() {
 		plog.Panicf("leader node called sendRateLimitMessage")
 	}
 	if r.leaderID == NoLeader {
@@ -620,8 +690,22 @@ func (r *raft) makeInstallSnapshotMessage(to uint64, m *pb.Message) uint64 {
 	if pb.IsEmptySnapshot(snapshot) {
 		plog.Panicf("%s got an empty snapshot", r.describe())
 	}
+	// For witness, snapshot message will be marked as dummy snapshot.
+	if _, ok := r.witnesses[to]; ok {
+		snapshot = makeWitnessSnapshot(snapshot)
+	}
 	m.Snapshot = snapshot
 	return snapshot.Index
+}
+
+func makeWitnessSnapshot(snapshot pb.Snapshot) pb.Snapshot {
+	result := snapshot
+	result.Filepath = ""
+	result.FileSize = 0
+	result.Files = nil
+	result.Witness = true
+	result.Dummy = false
+	return result
 }
 
 func (r *raft) makeReplicateMessage(to uint64,
@@ -642,6 +726,11 @@ func (r *raft) makeReplicateMessage(to uint64,
 				r.describe(), expected, lastIndex)
 		}
 	}
+	// Don't send actual log entry to witness as they won't replicate real message,
+	// unless there is a config change.
+	if _, ok := r.witnesses[to]; ok {
+		entries = makeMetadataEntries(entries)
+	}
 	return pb.Message{
 		To:       to,
 		Type:     pb.Replicate,
@@ -652,12 +741,30 @@ func (r *raft) makeReplicateMessage(to uint64,
 	}, nil
 }
 
+func makeMetadataEntries(entries []pb.Entry) []pb.Entry {
+	me := make([]pb.Entry, 0, len(entries))
+	for _, ent := range entries {
+		if ent.Type != pb.ConfigChangeEntry {
+			me = append(me, pb.Entry{
+				Type:  pb.MetadataEntry,
+				Index: ent.Index,
+				Term:  ent.Term,
+			})
+		} else {
+			me = append(me, ent)
+		}
+	}
+	return me
+}
+
 func (r *raft) sendReplicateMessage(to uint64) {
 	var rp *remote
 	if v, ok := r.remotes[to]; ok {
 		rp = v
+	} else if v, ok := r.observers[to]; ok {
+		rp = v
 	} else {
-		rp, ok = r.observers[to]
+		rp, ok = r.witnesses[to]
 		if !ok {
 			plog.Panicf("%s failed to get the remote instance", r.describe())
 		}
@@ -687,30 +794,23 @@ func (r *raft) sendReplicateMessage(to uint64) {
 }
 
 func (r *raft) broadcastReplicateMessage() {
-	if r.state != leader {
+	if !r.isLeader() {
 		panic("non-leader broadcasting replication msg")
-	}
-	for nid := range r.remotes {
-		if nid != r.nodeID {
-			r.sendReplicateMessage(nid)
-		}
 	}
 	for nid := range r.observers {
 		if nid == r.nodeID {
 			plog.Panicf("%s observer is broadcasting Replicate msg", r.describe())
 		}
-		r.sendReplicateMessage(nid)
+	}
+	for _, nid := range r.nodes() {
+		if nid != r.nodeID {
+			r.sendReplicateMessage(nid)
+		}
 	}
 }
 
 func (r *raft) sendHeartbeatMessage(to uint64,
-	hint pb.SystemCtx, toObserver bool) {
-	var match uint64
-	if toObserver {
-		match = r.observers[to].match
-	} else {
-		match = r.remotes[to].match
-	}
+	hint pb.SystemCtx, match uint64) {
 	commit := min(match, r.log.committed)
 	r.send(pb.Message{
 		To:       to,
@@ -735,14 +835,14 @@ func (r *raft) broadcastHeartbeatMessage() {
 
 func (r *raft) broadcastHeartbeatMessageWithHint(ctx pb.SystemCtx) {
 	zeroCtx := pb.SystemCtx{}
-	for id := range r.remotes {
+	for id, rm := range r.votingMembers() {
 		if id != r.nodeID {
-			r.sendHeartbeatMessage(id, ctx, false)
+			r.sendHeartbeatMessage(id, ctx, rm.match)
 		}
 	}
 	if ctx == zeroCtx {
-		for id := range r.observers {
-			r.sendHeartbeatMessage(id, zeroCtx, true)
+		for id, rm := range r.observers {
+			r.sendHeartbeatMessage(id, zeroCtx, rm.match)
 		}
 	}
 }
@@ -787,7 +887,7 @@ func (r *raft) sortMatchValues() {
 
 func (r *raft) tryCommit() bool {
 	r.mustBeLeader()
-	if len(r.remotes) != len(r.matched) {
+	if r.numVotingMembers() != len(r.matched) {
 		r.resetMatchValueArray()
 	}
 	idx := 0
@@ -795,8 +895,12 @@ func (r *raft) tryCommit() bool {
 		r.matched[idx] = v.match
 		idx++
 	}
+	for _, v := range r.witnesses {
+		r.matched[idx] = v.match
+		idx++
+	}
 	r.sortMatchValues()
-	q := r.matched[len(r.remotes)-r.quorum()]
+	q := r.matched[r.numVotingMembers()-r.quorum()]
 	// see p8 raft paper
 	// "Raft never commits log entries from previous terms by counting replicas.
 	// Only log entries from the leader’s current term are committed by counting
@@ -822,42 +926,58 @@ func (r *raft) appendEntries(entries []pb.Entry) {
 //
 
 func (r *raft) becomeObserver(term uint64, leaderID uint64) {
-	if r.state != observer {
+	if !r.isObserver() {
 		panic("transitioning to observer state from non-observer")
+	}
+	if r.isWitness() {
+		panic("transitioning to observer from witness state")
 	}
 	r.reset(term)
 	r.setLeaderID(leaderID)
-	plog.Infof("%s became an observer", r.describe())
+	plog.Infof("%s became observer", r.describe())
+}
+
+func (r *raft) becomeWitness(term uint64, leaderID uint64) {
+	if !r.isWitness() {
+		panic("transitioning to witness state from non-witness")
+	}
+	r.reset(term)
+	r.setLeaderID(leaderID)
+	plog.Infof("%s became witness", r.describe())
 }
 
 func (r *raft) becomeFollower(term uint64, leaderID uint64) {
+	if r.isWitness() {
+		panic("transitioning to follower from witness state")
+	}
 	r.state = follower
 	r.reset(term)
 	r.setLeaderID(leaderID)
-	plog.Infof("%s became a follower", r.describe())
+	plog.Infof("%s became follower", r.describe())
 }
 
 func (r *raft) becomeCandidate() {
-	if r.state == leader {
+	if r.isLeader() {
 		panic("transitioning to candidate state from leader")
 	}
-	if r.state == observer {
+	if r.isObserver() {
 		panic("observer is becoming candidate")
+	}
+	if r.isWitness() {
+		panic("witness is becoming candidate")
 	}
 	r.state = candidate
 	// 2nd paragraph section 5.2 of the raft paper
 	r.reset(r.term + 1)
 	r.setLeaderID(NoLeader)
 	r.vote = r.nodeID
-	plog.Infof("%s became a candidate", r.describe())
+	plog.Infof("%s became candidate", r.describe())
 }
 
 func (r *raft) becomeLeader() {
-	if r.state == follower {
-		panic("transitioning to leader state from follower")
-	}
-	if r.state == observer {
-		panic("observer is become leader")
+	// need a state transition machine
+	if !r.isLeader() && !r.isCandidate() {
+		plog.Panicf("transitioning to leader state from %v", r.state.String())
 	}
 	r.state = leader
 	r.reset(r.term)
@@ -865,7 +985,7 @@ func (r *raft) becomeLeader() {
 	r.preLeaderPromotionHandleConfigChange()
 	// p72 of the raft thesis
 	r.appendEntries([]pb.Entry{{Type: pb.ApplicationEntry, Cmd: nil}})
-	plog.Infof("%s became the leader", r.describe())
+	plog.Infof("%s became leader", r.describe())
 }
 
 func (r *raft) reset(term uint64) {
@@ -874,7 +994,7 @@ func (r *raft) reset(term uint64) {
 		r.vote = NoLeader
 	}
 	if r.rl.Enabled() {
-		r.rl.ResetFollowerState()
+		r.rl.Reset()
 	}
 	r.votes = make(map[uint64]bool)
 	r.electionTick = 0
@@ -885,6 +1005,7 @@ func (r *raft) reset(term uint64) {
 	r.abortLeaderTransfer()
 	r.resetRemotes()
 	r.resetObservers()
+	r.resetWitnesses()
 	r.resetMatchValueArray()
 }
 
@@ -923,17 +1044,28 @@ func (r *raft) resetObservers() {
 	}
 }
 
+func (r *raft) resetWitnesses() {
+	for id := range r.witnesses {
+		r.witnesses[id] = &remote{
+			next: r.log.lastIndex() + 1,
+		}
+		if id == r.nodeID {
+			r.witnesses[id].match = r.log.lastIndex()
+		}
+	}
+}
+
 //
 // election related functions
 //
 
 func (r *raft) handleVoteResp(from uint64, rejected bool) int {
 	if rejected {
-		plog.Infof("%s received RequestVoteResp rejection from %s at term %d",
-			r.describe(), NodeID(from), r.term)
+		plog.Infof("%s received RequestVoteResp rejection from %s",
+			r.describe(), NodeID(from))
 	} else {
-		plog.Infof("%s received RequestVoteResp from %s at term %d",
-			r.describe(), NodeID(from), r.term)
+		plog.Infof("%s received RequestVoteResp from %s",
+			r.describe(), NodeID(from))
 	}
 	votedFor := 0
 	if _, ok := r.votes[from]; !ok {
@@ -948,7 +1080,6 @@ func (r *raft) handleVoteResp(from uint64, rejected bool) int {
 }
 
 func (r *raft) campaign() {
-	plog.Infof("%s campaign called, remotes len: %d", r.describe(), len(r.remotes))
 	r.becomeCandidate()
 	term := r.term
 	if r.events != nil {
@@ -969,7 +1100,7 @@ func (r *raft) campaign() {
 		hint = r.nodeID
 		r.isLeaderTransferTarget = false
 	}
-	for k := range r.remotes {
+	for k := range r.votingMembers() {
 		if k == r.nodeID {
 			continue
 		}
@@ -981,7 +1112,7 @@ func (r *raft) campaign() {
 			LogTerm:  r.log.lastTerm(),
 			Hint:     hint,
 		})
-		plog.Infof("%s sent RequestVote to node %s", r.describe(), NodeID(k))
+		plog.Infof("%s sent RequestVote to %s", r.describe(), NodeID(k))
 	}
 }
 
@@ -990,8 +1121,12 @@ func (r *raft) campaign() {
 //
 
 func (r *raft) selfRemoved() bool {
-	if r.state == observer {
+	if r.isObserver() {
 		_, ok := r.observers[r.nodeID]
+		return !ok
+	}
+	if r.isWitness() {
+		_, ok := r.witnesses[r.nodeID]
 		return !ok
 	}
 	_, ok := r.remotes[r.nodeID]
@@ -1000,18 +1135,23 @@ func (r *raft) selfRemoved() bool {
 
 func (r *raft) addNode(nodeID uint64) {
 	r.clearPendingConfigChange()
+	if nodeID == r.nodeID && r.isWitness() {
+		plog.Panicf("%s is a witness", r.describe())
+	}
 	if _, ok := r.remotes[nodeID]; ok {
 		// already a voting member
 		return
 	}
 	if rp, ok := r.observers[nodeID]; ok {
-		// promoting to full member with inheriated progress info
+		// promoting to full member with inherited progress info
 		r.deleteObserver(nodeID)
 		r.remotes[nodeID] = rp
 		// local peer promoted, become follower
 		if nodeID == r.nodeID {
 			r.becomeFollower(r.term, r.leaderID)
 		}
+	} else if _, ok := r.witnesses[nodeID]; ok {
+		panic("could not promote witness to a full member")
 	} else {
 		r.setRemote(nodeID, 0, r.log.lastIndex()+1)
 	}
@@ -1019,24 +1159,39 @@ func (r *raft) addNode(nodeID uint64) {
 
 func (r *raft) addObserver(nodeID uint64) {
 	r.clearPendingConfigChange()
+	if nodeID == r.nodeID && !r.isObserver() {
+		plog.Panicf("%s iks not an observer", r.describe())
+	}
 	if _, ok := r.observers[nodeID]; ok {
 		return
 	}
 	r.setObserver(nodeID, 0, r.log.lastIndex()+1)
 }
 
+func (r *raft) addWitness(nodeID uint64) {
+	r.clearPendingConfigChange()
+	if nodeID == r.nodeID && !r.isWitness() {
+		plog.Panicf("%s is not a witness", r.describe())
+	}
+	if _, ok := r.witnesses[nodeID]; ok {
+		return
+	}
+	r.setWitness(nodeID, 0, r.log.lastIndex()+1)
+}
+
 func (r *raft) removeNode(nodeID uint64) {
 	r.deleteRemote(nodeID)
 	r.deleteObserver(nodeID)
+	r.deleteWitness(nodeID)
 	r.clearPendingConfigChange()
 	// step down as leader once it is removed
-	if r.nodeID == nodeID && r.state == leader {
+	if r.nodeID == nodeID && r.isLeader() {
 		r.becomeFollower(r.term, NoLeader)
 	}
 	if r.leaderTransfering() && r.leaderTransferTarget == nodeID {
 		r.abortLeaderTransfer()
 	}
-	if r.state == leader && len(r.remotes) > 0 {
+	if r.isLeader() && r.numVotingMembers() > 0 {
 		if r.tryCommit() {
 			r.broadcastReplicateMessage()
 		}
@@ -1045,27 +1200,38 @@ func (r *raft) removeNode(nodeID uint64) {
 
 func (r *raft) deleteRemote(nodeID uint64) {
 	delete(r.remotes, nodeID)
-	r.resetMatchValueArray()
 }
 
 func (r *raft) deleteObserver(nodeID uint64) {
 	delete(r.observers, nodeID)
 }
 
+func (r *raft) deleteWitness(nodeID uint64) {
+	delete(r.witnesses, nodeID)
+}
+
 func (r *raft) setRemote(nodeID uint64, match uint64, next uint64) {
-	plog.Infof("%s set remote, id %s, match %d, next %d",
+	plog.Infof("%s set remote %s, match %d, next %d",
 		r.describe(), NodeID(nodeID), match, next)
 	r.remotes[nodeID] = &remote{
 		next:  next,
 		match: match,
 	}
-	r.resetMatchValueArray()
 }
 
 func (r *raft) setObserver(nodeID uint64, match uint64, next uint64) {
-	plog.Infof("%s set observer, id %s, match %d, next %d",
+	plog.Infof("%s set observer %s, match %d, next %d",
 		r.describe(), NodeID(nodeID), match, next)
 	r.observers[nodeID] = &remote{
+		next:  next,
+		match: match,
+	}
+}
+
+func (r *raft) setWitness(nodeID uint64, match uint64, next uint64) {
+	plog.Infof("%s set witness %s, match %d, next %d",
+		r.describe(), NodeID(nodeID), match, next)
+	r.witnesses[nodeID] = &remote{
 		next:  next,
 		match: match,
 	}
@@ -1229,6 +1395,9 @@ func (r *raft) dropRequestVoteFromHighTermNode(m pb.Message) bool {
 			r.describe(), m.From)
 		return false
 	}
+	if r.isLeader() && !r.quiesce && r.electionTick >= r.electionTimeout {
+		panic("r.electionTick >= r.electionTimeout on leader")
+	}
 	// we got a RequestVote with higher term, but we recently had heartbeat msg
 	// from leader within the minimum election timeout and that leader is known
 	// to have quorum. we thus drop such RequestVote to minimize interruption by
@@ -1249,10 +1418,12 @@ func (r *raft) onMessageTermNotMatched(m pb.Message) bool {
 		return false
 	}
 	if r.dropRequestVoteFromHighTermNode(m) {
+		plog.Infof("dropped RequestVote at term %d from %d, leader available",
+			m.Term, m.From)
 		return true
 	}
 	if m.Term > r.term {
-		plog.Infof("%s received a %s with higher term (%d) from %s",
+		plog.Infof("%s received %s with higher term (%d) from %s",
 			r.describe(), m.Type, m.Term, NodeID(m.From))
 		leaderID := NoLeader
 		if isLeaderMessage(m.Type) {
@@ -1261,6 +1432,8 @@ func (r *raft) onMessageTermNotMatched(m pb.Message) bool {
 
 		if r.isObserver() {
 			r.becomeObserver(m.Term, leaderID)
+		} else if r.isWitness() {
+			r.becomeWitness(m.Term, leaderID)
 		} else {
 			r.becomeFollower(m.Term, leaderID)
 		}
@@ -1283,7 +1456,7 @@ func (r *raft) Handle(m pb.Message) {
 		r.doubleCheckTermMatched(m.Term)
 		r.handle(r, m)
 	} else {
-		plog.Infof("term not matched")
+		plog.Infof("dropped %s from %d, term not matched", m.Type, m.From)
 	}
 }
 
@@ -1310,19 +1483,19 @@ func (r *raft) canGrantVote(m pb.Message) bool {
 //
 
 func (r *raft) handleNodeElection(m pb.Message) {
-	if r.state != leader {
+	if !r.isLeader() {
 		// there can be multiple pending membership change entries committed but not
 		// applied on this node. say with a cluster of X, Y and Z, there are two
 		// such entries for adding node A and B are committed but not applied
 		// available on X. If X is allowed to start a new election, it can become the
 		// leader with a vote from any one of the node Y or Z. Further proposals made
 		// by the new leader X in the next term will require a quorum of 2 which can
-		// has no overlap with the committed quorum of 3. this violates the safety
+		// have no overlap with the committed quorum of 3. this violates the safety
 		// requirement of raft.
 		// ignore the Election message when there is membership configure change
 		// committed but not applied
 		if r.hasConfigChangeToApply() {
-			plog.Warningf("%s campaign skipped due to pending Config Change",
+			plog.Warningf("%s campaign skipped, pending config change",
 				r.describe())
 			if r.events != nil {
 				info := server.CampaignInfo{
@@ -1334,7 +1507,7 @@ func (r *raft) handleNodeElection(m pb.Message) {
 			}
 			return
 		}
-		plog.Infof("%s will campaign at term %d", r.describe(), r.term)
+		plog.Infof("%s will campaign", r.describe())
 		r.campaign()
 	} else {
 		plog.Infof("%s is leader, ignored Election", r.describe())
@@ -1377,6 +1550,8 @@ func (r *raft) handleNodeConfigChange(m pb.Message) {
 			r.removeNode(nodeid)
 		case pb.AddObserver:
 			r.addObserver(nodeid)
+		case pb.AddWitness:
+			r.addWitness(nodeid)
 		default:
 			panic("unexpected config change type")
 		}
@@ -1407,7 +1582,7 @@ func (r *raft) handleLeaderHeartbeat(m pb.Message) {
 func (r *raft) handleLeaderCheckQuorum(m pb.Message) {
 	r.mustBeLeader()
 	if !r.leaderHasQuorum() {
-		plog.Warningf("%s stepped down, no longer has quorum", r.describe())
+		plog.Warningf("%s has lost quorum", r.describe())
 		r.becomeFollower(r.term, NoLeader)
 	}
 }
@@ -1415,14 +1590,14 @@ func (r *raft) handleLeaderCheckQuorum(m pb.Message) {
 func (r *raft) handleLeaderPropose(m pb.Message) {
 	r.mustBeLeader()
 	if r.leaderTransfering() {
-		plog.Warningf("%s dropped a proposal, leader transferring", r.describe())
+		plog.Warningf("%s dropped proposal, leader transferring", r.describe())
 		r.reportDroppedProposal(m)
 		return
 	}
 	for i, e := range m.Entries {
 		if e.Type == pb.ConfigChangeEntry {
 			if r.hasPendingConfigChange() {
-				plog.Warningf("%s dropped extra config change", r.describe())
+				plog.Warningf("%s dropped config change, pending change", r.describe())
 				r.reportDroppedConfigChange(m.Entries[i])
 				m.Entries[i] = pb.Entry{Type: pb.ApplicationEntry}
 			}
@@ -1464,7 +1639,9 @@ func (r *raft) handleLeaderReadIndex(m pb.Message) {
 		High: m.HintHigh,
 		Low:  m.Hint,
 	}
-	if !r.isSingleNodeQuorum() {
+	if _, wok := r.witnesses[m.From]; wok {
+		plog.Errorf("%s dropped ReadIndex, witness node %d", r.describe(), m.From)
+	} else if !r.isSingleNodeQuorum() {
 		if !r.hasCommittedEntryAtCurrentTerm() {
 			// leader doesn't know the commit value of the cluster
 			// see raft thesis section 6.4, this is the first step of the ReadIndex
@@ -1477,8 +1654,8 @@ func (r *raft) handleLeaderReadIndex(m pb.Message) {
 		r.broadcastHeartbeatMessageWithHint(ctx)
 	} else {
 		r.addReadyToRead(r.log.committed, ctx)
-		_, ok := r.observers[m.From]
-		if m.From != r.nodeID && ok {
+		_, ook := r.observers[m.From]
+		if m.From != r.nodeID && ook {
 			r.send(pb.Message{
 				To:       m.From,
 				Type:     pb.ReadIndexResp,
@@ -1607,7 +1784,7 @@ func (r *raft) handleLeaderRateLimit(m pb.Message) {
 	if r.rl.Enabled() {
 		r.rl.SetFollowerState(m.From, m.Hint)
 	} else {
-		plog.Warningf("%s dropped rate limit msg as rl disabled", r.describe())
+		plog.Warningf("%s dropped rate limit msg, rl disabled", r.describe())
 	}
 }
 
@@ -1646,12 +1823,28 @@ func (r *raft) handleObserverReadIndexResp(m pb.Message) {
 }
 
 //
+// message handlers used by witness, re-route them to follower handlers
+//
+
+func (r *raft) handleWitnessReplicate(m pb.Message) {
+	r.handleFollowerReplicate(m)
+}
+
+func (r *raft) handleWitnessHeartbeat(m pb.Message) {
+	r.handleFollowerHeartbeat(m)
+}
+
+func (r *raft) handleWitnessSnapshot(m pb.Message) {
+	r.handleFollowerInstallSnapshot(m)
+}
+
+//
 // message handlers used by follower
 //
 
 func (r *raft) handleFollowerPropose(m pb.Message) {
 	if r.leaderID == NoLeader {
-		plog.Warningf("%s dropped proposal as no leader", r.describe())
+		plog.Warningf("%s dropped proposal, no leader", r.describe())
 		r.reportDroppedProposal(m)
 		return
 	}
@@ -1663,21 +1856,25 @@ func (r *raft) handleFollowerPropose(m pb.Message) {
 	r.send(m)
 }
 
-func (r *raft) handleFollowerReplicate(m pb.Message) {
+func (r *raft) leaderIsAvailable() {
 	r.electionTick = 0
+}
+
+func (r *raft) handleFollowerReplicate(m pb.Message) {
+	r.leaderIsAvailable()
 	r.setLeaderID(m.From)
 	r.handleReplicateMessage(m)
 }
 
 func (r *raft) handleFollowerHeartbeat(m pb.Message) {
-	r.electionTick = 0
+	r.leaderIsAvailable()
 	r.setLeaderID(m.From)
 	r.handleHeartbeatMessage(m)
 }
 
 func (r *raft) handleFollowerReadIndex(m pb.Message) {
 	if r.leaderID == NoLeader {
-		plog.Warningf("%s dropped ReadIndex as no leader", r.describe())
+		plog.Warningf("%s dropped ReadIndex, no leader", r.describe())
 		r.reportDroppedReadIndex(m)
 		return
 	}
@@ -1687,7 +1884,7 @@ func (r *raft) handleFollowerReadIndex(m pb.Message) {
 
 func (r *raft) handleFollowerLeaderTransfer(m pb.Message) {
 	if r.leaderID == NoLeader {
-		plog.Warningf("%s dropped LeaderTransfer as no leader", r.describe())
+		plog.Warningf("%s dropped LeaderTransfer, no leader", r.describe())
 		return
 	}
 	m.To = r.leaderID
@@ -1699,13 +1896,13 @@ func (r *raft) handleFollowerReadIndexResp(m pb.Message) {
 		Low:  m.Hint,
 		High: m.HintHigh,
 	}
-	r.electionTick = 0
+	r.leaderIsAvailable()
 	r.setLeaderID(m.From)
 	r.addReadyToRead(m.LogIndex, ctx)
 }
 
 func (r *raft) handleFollowerInstallSnapshot(m pb.Message) {
-	r.electionTick = 0
+	r.leaderIsAvailable()
 	r.setLeaderID(m.From)
 	r.handleInstallSnapshotMessage(m)
 }
@@ -1738,7 +1935,7 @@ func (r *raft) handleCandidatePropose(m pb.Message) {
 }
 
 func (r *raft) handleCandidateReadIndex(m pb.Message) {
-	plog.Warningf("%s dropped read index request, no leader", r.describe())
+	plog.Warningf("%s dropped read index, no leader", r.describe())
 	r.reportDroppedReadIndex(m)
 	ctx := pb.SystemCtx{
 		Low:  m.Hint,
@@ -1824,6 +2021,8 @@ func lw(r *raft, f func(m pb.Message, rp *remote)) handlerFunc {
 			f(nm, npr)
 		} else if nob, ok := r.observers[nm.From]; ok {
 			f(nm, nob)
+		} else if wob, ok := r.witnesses[nm.From]; ok {
+			f(nm, wob)
 		} else {
 			plog.Infof("%s no remote for %s", r.describe(), NodeID(nm.From))
 			return
@@ -1892,6 +2091,14 @@ func (r *raft) initializeHandlerMap() {
 	r.handlers[observer][pb.ConfigChangeEvent] = r.handleNodeConfigChange
 	r.handlers[observer][pb.LocalTick] = r.handleLocalTick
 	r.handlers[observer][pb.SnapshotReceived] = r.handleRestoreRemote
+	// witness
+	r.handlers[witness][pb.Heartbeat] = r.handleWitnessHeartbeat
+	r.handlers[witness][pb.Replicate] = r.handleWitnessReplicate
+	r.handlers[witness][pb.InstallSnapshot] = r.handleWitnessSnapshot
+	r.handlers[witness][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[witness][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[witness][pb.LocalTick] = r.handleLocalTick
+	r.handlers[witness][pb.SnapshotReceived] = r.handleRestoreRemote
 }
 
 func (r *raft) checkHandlerMap() {
@@ -1917,6 +2124,13 @@ func (r *raft) checkHandlerMap() {
 		{observer, pb.RequestVoteResp},
 		{observer, pb.ReplicateResp},
 		{observer, pb.HeartbeatResp},
+		{witness, pb.Election},
+		{witness, pb.Propose},
+		{witness, pb.ReadIndex},
+		{witness, pb.ReadIndexResp},
+		{witness, pb.RequestVoteResp},
+		{witness, pb.ReplicateResp},
+		{witness, pb.HeartbeatResp},
 	}
 	for _, tt := range checks {
 		f := r.handlers[tt.stateType][tt.msgType]
@@ -1929,7 +2143,6 @@ func (r *raft) checkHandlerMap() {
 //
 // debugging related functions
 //
-
 func (r *raft) dumpRaftInfoToLog(addrMap map[uint64]string) {
 	var flag string
 	if r.leaderID != NoLeader && r.leaderID == r.nodeID {
@@ -1937,7 +2150,8 @@ func (r *raft) dumpRaftInfoToLog(addrMap map[uint64]string) {
 	} else {
 		flag = "###"
 	}
-	plog.Infof("%s Raft node %s, %d remote nodes", flag, r.describe(), len(r.remotes))
+	plog.Infof("%s Raft node %s, %d remote nodes",
+		flag, r.describe(), len(r.remotes))
 	for id, rp := range r.remotes {
 		v, ok := addrMap[id]
 		if !ok {

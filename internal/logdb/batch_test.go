@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/lni/dragonboat/v3/internal/vfs"
 	"github.com/lni/dragonboat/v3/raftio"
 	pb "github.com/lni/dragonboat/v3/raftpb"
 )
@@ -317,7 +318,7 @@ func TestEntryBatchWillNotBeMergedToPreviousBatch(t *testing.T) {
 		if err != nil {
 			t.Errorf("failed to save recs")
 		}
-		maxIndex, err := db.(*ShardedRDB).shards[0].readMaxIndex(clusterID, nodeID)
+		maxIndex, err := db.(*ShardedRDB).shards[0].getMaxIndex(clusterID, nodeID)
 		if err != nil {
 			t.Errorf("failed to get max index")
 		}
@@ -335,7 +336,8 @@ func TestEntryBatchWillNotBeMergedToPreviousBatch(t *testing.T) {
 			t.Errorf("unexpected index %d, want 10", eb.Entries[0].Index)
 		}
 	}
-	runBatchedLogDBTest(t, tf)
+	fs := vfs.GetTestFS()
+	runBatchedLogDBTest(t, tf, fs)
 }
 
 func TestEntryBatchMergedNotLastBatch(t *testing.T) {
@@ -368,7 +370,7 @@ func TestEntryBatchMergedNotLastBatch(t *testing.T) {
 		if err != nil {
 			t.Errorf("failed to save recs")
 		}
-		maxIndex, err := db.(*ShardedRDB).shards[0].readMaxIndex(clusterID, nodeID)
+		maxIndex, err := db.(*ShardedRDB).shards[0].getMaxIndex(clusterID, nodeID)
 		if err != nil {
 			t.Errorf("failed to get max index")
 		}
@@ -398,7 +400,8 @@ func TestEntryBatchMergedNotLastBatch(t *testing.T) {
 			}
 		}
 	}
-	runBatchedLogDBTest(t, tf)
+	fs := vfs.GetTestFS()
+	runBatchedLogDBTest(t, tf, fs)
 }
 
 func TestSaveEntriesAcrossMultipleBatches(t *testing.T) {
@@ -465,5 +468,6 @@ func TestSaveEntriesAcrossMultipleBatches(t *testing.T) {
 			plog.Infof("idx %d", e.Index)
 		}
 	}
-	runBatchedLogDBTest(t, tf)
+	fs := vfs.GetTestFS()
+	runBatchedLogDBTest(t, tf, fs)
 }

@@ -16,16 +16,15 @@ package server
 
 import (
 	"fmt"
-	"io/ioutil"
-	"os"
-	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/lni/dragonboat/v3/config"
+	"github.com/lni/dragonboat/v3/internal/fileutil"
 	"github.com/lni/dragonboat/v3/internal/settings"
+	"github.com/lni/dragonboat/v3/internal/vfs"
 	"github.com/lni/dragonboat/v3/raftio"
 	"github.com/lni/dragonboat/v3/raftpb"
-	"github.com/lni/goutils/fileutil"
 )
 
 const (
@@ -46,52 +45,65 @@ func getTestNodeHostConfig() config.NodeHostConfig {
 }
 
 func TestCheckNodeHostDirWorksWhenEverythingMatches(t *testing.T) {
-	defer os.RemoveAll(singleNodeHostTestDir)
+	fs := vfs.GetTestFS()
 	defer func() {
-		if r := recover(); r != nil {
-			t.Fatalf("panic not expected")
+		if err := fs.RemoveAll(singleNodeHostTestDir); err != nil {
+			t.Fatalf("%v", err)
 		}
 	}()
-	c := getTestNodeHostConfig()
-	ctx, err := NewContext(c)
-	if err != nil {
-		t.Fatalf("failed to new context %v", err)
-	}
-	if _, _, err := ctx.CreateNodeHostDir(testDeploymentID); err != nil {
-		t.Fatalf("%v", err)
-	}
-	dirs, _ := ctx.getDataDirs()
-	testName := "test-name"
-	status := raftpb.RaftDataStatus{
-		Address:      testAddress,
-		BinVer:       raftio.LogDBBinVersion,
-		HardHash:     settings.Hard.Hash(),
-		LogdbType:    testName,
-		Hostname:     ctx.hostname,
-		DeploymentId: testDeploymentID,
-	}
-	err = fileutil.CreateFlagFile(dirs[0], addressFilename, &status)
-	if err != nil {
-		t.Errorf("failed to create flag file %v", err)
-	}
-	if err := ctx.CheckNodeHostDir(testDeploymentID,
-		testAddress, raftio.LogDBBinVersion, testName); err != nil {
-		t.Fatalf("check node host dir failed %v", err)
-	}
+	func() {
+		c := getTestNodeHostConfig()
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panic not expected")
+			}
+		}()
+		ctx, err := NewContext(c, fs)
+		if err != nil {
+			t.Fatalf("failed to new context %v", err)
+		}
+		if _, _, err := ctx.CreateNodeHostDir(testDeploymentID); err != nil {
+			t.Fatalf("%v", err)
+		}
+		dir, _ := ctx.getDataDirs()
+		testName := "test-name"
+		status := raftpb.RaftDataStatus{
+			Address:      testAddress,
+			BinVer:       raftio.LogDBBinVersion,
+			HardHash:     settings.Hard.Hash(),
+			LogdbType:    testName,
+			Hostname:     ctx.hostname,
+			DeploymentId: testDeploymentID,
+		}
+		err = fileutil.CreateFlagFile(dir, flagFilename, &status, fs)
+		if err != nil {
+			t.Errorf("failed to create flag file %v", err)
+		}
+		if err := ctx.CheckNodeHostDir(testDeploymentID,
+			testAddress, raftio.LogDBBinVersion, testName); err != nil {
+			t.Fatalf("check node host dir failed %v", err)
+		}
+	}()
+	reportLeakedFD(fs, t)
 }
 
 func testNodeHostDirectoryDetectsMismatches(t *testing.T,
-	addr string, hostname string, binVer uint32, name string, hardHashMismatch bool, expErr error) {
-	defer os.RemoveAll(singleNodeHostTestDir)
+	addr string, hostname string, binVer uint32, name string,
+	hardHashMismatch bool, expErr error, fs vfs.IFS) {
 	c := getTestNodeHostConfig()
-	ctx, err := NewContext(c)
+	defer func() {
+		if err := fs.RemoveAll(singleNodeHostTestDir); err != nil {
+			t.Fatalf("%v", err)
+		}
+	}()
+	ctx, err := NewContext(c, fs)
 	if err != nil {
 		t.Fatalf("failed to new context %v", err)
 	}
 	if _, _, err := ctx.CreateNodeHostDir(testDeploymentID); err != nil {
 		t.Fatalf("%v", err)
 	}
-	dirs, _ := ctx.getDataDirs()
+	dir, _ := ctx.getDataDirs()
 	status := raftpb.RaftDataStatus{
 		Address:   addr,
 		BinVer:    binVer,
@@ -102,7 +114,7 @@ func testNodeHostDirectoryDetectsMismatches(t *testing.T,
 	if hardHashMismatch {
 		status.HardHash = 1
 	}
-	err = fileutil.CreateFlagFile(dirs[0], addressFilename, &status)
+	err = fileutil.CreateFlagFile(dir, flagFilename, &status, fs)
 	if err != nil {
 		t.Errorf("failed to create flag file %v", err)
 	}
@@ -111,37 +123,53 @@ func testNodeHostDirectoryDetectsMismatches(t *testing.T,
 	if err != expErr {
 		t.Errorf("expect err %v, got %v", expErr, err)
 	}
+	reportLeakedFD(fs, t)
 }
 
 func TestCanDetectMismatchedHostname(t *testing.T) {
+	fs := vfs.GetTestFS()
 	testNodeHostDirectoryDetectsMismatches(t,
-		testAddress, "incorrect-hostname", raftio.LogDBBinVersion, testLogDBName, false, ErrHostnameChanged)
+		testAddress, "incorrect-hostname", raftio.LogDBBinVersion,
+		testLogDBName, false, ErrHostnameChanged, fs)
 }
 
 func TestCanDetectMismatchedLogDBName(t *testing.T) {
+	fs := vfs.GetTestFS()
 	testNodeHostDirectoryDetectsMismatches(t,
-		testAddress, "", raftio.LogDBBinVersion, "incorrect name", false, ErrLogDBType)
+		testAddress, "", raftio.LogDBBinVersion,
+		"incorrect name", false, ErrLogDBType, fs)
 }
 
 func TestCanDetectMismatchedBinVer(t *testing.T) {
+	fs := vfs.GetTestFS()
 	testNodeHostDirectoryDetectsMismatches(t,
-		testAddress, "", raftio.LogDBBinVersion+1, testLogDBName, false, ErrIncompatibleData)
+		testAddress, "", raftio.LogDBBinVersion+1,
+		testLogDBName, false, ErrIncompatibleData, fs)
 }
 
 func TestCanDetectMismatchedAddress(t *testing.T) {
+	fs := vfs.GetTestFS()
 	testNodeHostDirectoryDetectsMismatches(t,
-		"invalid:12345", "", raftio.LogDBBinVersion, testLogDBName, false, ErrNotOwner)
+		"invalid:12345", "", raftio.LogDBBinVersion,
+		testLogDBName, false, ErrNotOwner, fs)
 }
 
 func TestCanDetectMismatchedHardHash(t *testing.T) {
+	fs := vfs.GetTestFS()
 	testNodeHostDirectoryDetectsMismatches(t,
-		testAddress, "", raftio.LogDBBinVersion, testLogDBName, true, ErrHardSettingsChanged)
+		testAddress, "", raftio.LogDBBinVersion,
+		testLogDBName, true, ErrHardSettingsChanged, fs)
 }
 
 func TestLockFileCanBeLockedAndUnlocked(t *testing.T) {
-	defer os.RemoveAll(singleNodeHostTestDir)
+	fs := vfs.GetTestFS()
 	c := getTestNodeHostConfig()
-	ctx, err := NewContext(c)
+	defer func() {
+		if err := fs.RemoveAll(singleNodeHostTestDir); err != nil {
+			t.Fatalf("%v", err)
+		}
+	}()
+	ctx, err := NewContext(c, fs)
 	if err != nil {
 		t.Fatalf("failed to new context %v", err)
 	}
@@ -151,56 +179,91 @@ func TestLockFileCanBeLockedAndUnlocked(t *testing.T) {
 	if err := ctx.LockNodeHostDir(); err != nil {
 		t.Fatalf("failed to lock the directory %v", err)
 	}
-	for fp := range ctx.flocks {
-		if filepath.Base(fp) != lockFilename {
-			t.Fatalf("not the lock file")
-		}
-		fl := fileutil.New(fp)
-		locked, err := fl.TryLock()
-		if err != nil {
-			t.Fatalf("try lock failed %v", err)
-		}
-		if locked {
-			t.Fatalf("managed to lock the file again")
-		}
-	}
 	ctx.Stop()
-	if err := ctx.LockNodeHostDir(); err != nil {
-		t.Fatalf("failed to lock the directory %v", err)
-	}
+	reportLeakedFD(fs, t)
 }
 
 func TestRemoveSavedSnapshots(t *testing.T) {
-	os.RemoveAll(singleNodeHostTestDir)
-	if err := os.MkdirAll(singleNodeHostTestDir, 0755); err != nil {
+	fs := vfs.GetTestFS()
+	if err := fs.RemoveAll(singleNodeHostTestDir); err != nil {
 		t.Fatalf("%v", err)
 	}
-	defer os.RemoveAll(singleNodeHostTestDir)
+	if err := fs.MkdirAll(singleNodeHostTestDir, 0755); err != nil {
+		t.Fatalf("%v", err)
+	}
+	defer func() {
+		if err := fs.RemoveAll(singleNodeHostTestDir); err != nil {
+			t.Fatalf("%v", err)
+		}
+	}()
 	for i := 0; i < 16; i++ {
-		ssdir := filepath.Join(singleNodeHostTestDir, fmt.Sprintf("snapshot-%X", i))
-		if err := os.MkdirAll(ssdir, 0755); err != nil {
+		ssdir := fs.PathJoin(singleNodeHostTestDir, fmt.Sprintf("snapshot-%X", i))
+		if err := fs.MkdirAll(ssdir, 0755); err != nil {
 			t.Fatalf("failed to mkdir %v", err)
 		}
 	}
 	for i := 1; i <= 2; i++ {
-		ssdir := filepath.Join(singleNodeHostTestDir, fmt.Sprintf("mydata-%X", i))
-		if err := os.MkdirAll(ssdir, 0755); err != nil {
+		ssdir := fs.PathJoin(singleNodeHostTestDir, fmt.Sprintf("mydata-%X", i))
+		if err := fs.MkdirAll(ssdir, 0755); err != nil {
 			t.Fatalf("failed to mkdir %v", err)
 		}
 	}
-	if err := removeSavedSnapshots(singleNodeHostTestDir); err != nil {
+	if err := removeSavedSnapshots(singleNodeHostTestDir, fs); err != nil {
 		t.Fatalf("failed to remove saved snapshots %v", err)
 	}
-	files, err := ioutil.ReadDir(singleNodeHostTestDir)
+	files, err := fs.List(singleNodeHostTestDir)
 	if err != nil {
 		t.Fatalf("failed to read dir %v", err)
 	}
-	for _, fi := range files {
+	for _, fn := range files {
+		fi, err := fs.Stat(fs.PathJoin(singleNodeHostTestDir, fn))
+		if err != nil {
+			t.Fatalf("failed to get stat %v", err)
+		}
 		if !fi.IsDir() {
 			t.Errorf("found unexpected file %v", fi)
 		}
 		if fi.Name() != "mydata-1" && fi.Name() != "mydata-2" {
 			t.Errorf("unexpected dir found %s", fi.Name())
 		}
+	}
+	reportLeakedFD(fs, t)
+}
+
+func TestCompatibleLogDBType(t *testing.T) {
+	sc := &Context{}
+	if !sc.compatibleLogDBType("rocksdb", "pebble") ||
+		!sc.compatibleLogDBType("pebble", "rocksdb") {
+		t.Errorf("rocksdb/pebble marked as not compatible")
+	}
+	if sc.compatibleLogDBType("rocksdb", "1") ||
+		sc.compatibleLogDBType("pebble", "2") ||
+		sc.compatibleLogDBType("1", "rocksdb") ||
+		sc.compatibleLogDBType("2", "pebble") {
+		t.Errorf("unexpectedly marked as compatible")
+	}
+}
+
+func TestWALDirCanBeSet(t *testing.T) {
+	walDir := "d2-wal-dir-name"
+	nhConfig := config.NodeHostConfig{
+		NodeHostDir: "d1",
+		WALDir:      walDir,
+	}
+	fs := vfs.GetTestFS()
+	c, err := NewContext(nhConfig, fs)
+	if err != nil {
+		t.Fatalf("failed to get context %v", err)
+	}
+	defer c.Stop()
+	dir, lldir := c.GetLogDBDirs(12345)
+	if dir == lldir {
+		t.Errorf("wal dir not considered")
+	}
+	if !strings.Contains(lldir, walDir) {
+		t.Errorf("wal dir not used, %s", lldir)
+	}
+	if strings.Contains(dir, walDir) {
+		t.Errorf("wal dir appeared in node host dir, %s", dir)
 	}
 }

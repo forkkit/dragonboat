@@ -12,16 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build dragonboat_monkeytest dragonboat_slowtest
+// +build dragonboat_monkeytest
 
 package dragonboat
 
 import (
 	"sync/atomic"
 
+	"github.com/lni/dragonboat/v3/config"
 	"github.com/lni/dragonboat/v3/internal/logdb"
 	"github.com/lni/dragonboat/v3/internal/server"
 	"github.com/lni/dragonboat/v3/internal/transport"
+	"github.com/lni/dragonboat/v3/internal/vfs"
 	"github.com/lni/dragonboat/v3/raftio"
 )
 
@@ -34,6 +36,16 @@ func ApplyMonkeySettings() {
 // code here is used in testing only.
 //
 
+// MemFS is a in memory vfs intended to be used in testing. User applications
+// can usually ignore such vfs related types and fields.
+type MemFS = vfs.MemFS
+
+// GetTestFS returns a vfs instance that can be used in testing. User
+// applications can usually ignore such vfs related types and fields.
+func GetTestFS() config.IFS {
+	return vfs.GetTestFS()
+}
+
 // Clusters returns a list of raft nodes managed by the nodehost instance.
 func (nh *NodeHost) Clusters() []*node {
 	result := make([]*node, 0)
@@ -45,6 +57,14 @@ func (nh *NodeHost) Clusters() []*node {
 	nh.clusterMu.RUnlock()
 
 	return result
+}
+
+func SetPendingProposalShards(sz uint64) {
+	pendingProposalShards = sz
+}
+
+func SetTaskBatchSize(sz uint64) {
+	taskBatchSize = sz
 }
 
 func SetIncomingProposalsMaxLen(sz uint64) {
@@ -99,7 +119,7 @@ func (n *node) GetMembershipHash() uint64 {
 	return n.getMembershipHash()
 }
 
-func (n *node) GetRateLimiter() *server.RateLimiter {
+func (n *node) GetRateLimiter() *server.InMemRateLimiter {
 	return n.p.GetRateLimiter()
 }
 
@@ -126,8 +146,8 @@ func (n *node) getMembershipHash() uint64 {
 func (n *node) dumpRaftInfoToLog() {
 	if n.p != nil {
 		addrMap := make(map[uint64]string)
-		nodes, _, _, _ := n.sm.GetMembership()
-		for nodeID := range nodes {
+		m := n.sm.GetMembership()
+		for nodeID := range m.Addresses {
 			if nodeID == n.nodeID {
 				addrMap[nodeID] = n.raftAddress
 			} else {
@@ -141,25 +161,20 @@ func (n *node) dumpRaftInfoToLog() {
 	}
 }
 
-// Set how many snapshot worker to use in step engine. This function is
-// expected to be called only during monkeytest, it doesn't exist when the
-// monkeytest tag is not set.
+// SetSnapshotWorkerCount sets how many snapshot workers to use in during
+// monkeytest.
 func SetSnapshotWorkerCount(count uint64) {
 	snapshotWorkerCount = count
 }
 
-// Set how many worker to use in step engine. This function is
-// expected to be called only during monkeytest, it doesn't exist when the
-// monkeytest tag is not set.
-func SetWorkerCount(count uint64) {
-	workerCount = count
+// SetStepWorkerCount sets how many step workers to use during monkeytest.
+func SetStepWorkerCount(count uint64) {
+	stepWorkerCount = count
 }
 
-// Set how many task worker to use in step engine. This function is
-// expected to be called only during monkeytest, it doesn't exist when the
-// monkeytest tag is not set.
-func SetTaskWorkerCount(count uint64) {
-	taskWorkerCount = count
+// SetApplyWorkerCount sets how many apply workers to use during monkeytest.
+func SetApplyWorkerCount(count uint64) {
+	applyWorkerCount = count
 }
 
 // testParitionState struct is used to manage the state whether nodehost is in

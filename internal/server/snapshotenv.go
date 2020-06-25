@@ -24,9 +24,8 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/golang/protobuf/proto"
-
-	"github.com/lni/goutils/fileutil"
+	"github.com/lni/dragonboat/v3/internal/fileutil"
+	"github.com/lni/dragonboat/v3/internal/vfs"
 )
 
 var (
@@ -122,12 +121,13 @@ type SSEnv struct {
 	tmpDir   string
 	finalDir string
 	filepath string
+	fs       vfs.IFS
 }
 
 // NewSSEnv creates and returns a new SSEnv instance.
 func NewSSEnv(f GetSnapshotDirFunc,
 	clusterID uint64, nodeID uint64, index uint64,
-	from uint64, mode Mode) *SSEnv {
+	from uint64, mode Mode, fs vfs.IFS) *SSEnv {
 	var tmpSuffix string
 	if mode == SnapshottingMode {
 		tmpSuffix = genTmpDirSuffix
@@ -135,7 +135,7 @@ func NewSSEnv(f GetSnapshotDirFunc,
 		tmpSuffix = recvTmpDirSuffix
 	}
 	rootDir := f(clusterID, nodeID)
-	fp := filepath.Join(getFinalSnapshotDirName(rootDir, index),
+	fp := fs.PathJoin(getFinalSnapshotDirName(rootDir, index),
 		getSnapshotFilename(index))
 	return &SSEnv{
 		index:    index,
@@ -143,6 +143,7 @@ func NewSSEnv(f GetSnapshotDirFunc,
 		tmpDir:   getTempSnapshotDirName(rootDir, tmpSuffix, index, from),
 		finalDir: getFinalSnapshotDirName(rootDir, index),
 		filepath: fp,
+		fs:       fs,
 	}
 }
 
@@ -183,20 +184,16 @@ func (se *SSEnv) MustRemoveTempDir() {
 }
 
 // FinalizeSnapshot finalizes the snapshot.
-func (se *SSEnv) FinalizeSnapshot(msg proto.Message) error {
+func (se *SSEnv) FinalizeSnapshot(msg fileutil.Marshaler) error {
 	finalizeLock.Lock()
 	defer finalizeLock.Unlock()
 	if err := se.createFlagFile(msg); err != nil {
 		return err
 	}
-	if se.isFinalDirExists() {
+	if se.finalDirExists() {
 		return ErrSnapshotOutOfDate
 	}
-	err := se.renameTempDirToFinalDir()
-	if err == ErrSnapshotOutOfDate {
-		panic("got ErrSnapshotOutOfDate after confirming no final dir")
-	}
-	return err
+	return se.renameTempDirToFinalDir()
 }
 
 // CreateTempDir creates the temp snapshot directory.
@@ -210,17 +207,17 @@ func (se *SSEnv) RemoveFinalDir() error {
 }
 
 // SaveSSMetadata saves the metadata of the snapshot file.
-func (se *SSEnv) SaveSSMetadata(msg proto.Message) error {
+func (se *SSEnv) SaveSSMetadata(msg fileutil.Marshaler) error {
 	err := fileutil.CreateFlagFile(se.tmpDir,
-		SnapshotMetadataFilename, msg)
+		SnapshotMetadataFilename, msg, se.fs)
 	return err
 }
 
 // HasFlagFile returns a boolean flag indicating whether the flag file is
 // available in the final directory.
 func (se *SSEnv) HasFlagFile() bool {
-	fp := filepath.Join(se.finalDir, fileutil.SnapshotFlagFilename)
-	if _, err := os.Stat(fp); os.IsNotExist(err) {
+	fp := se.fs.PathJoin(se.finalDir, fileutil.SnapshotFlagFilename)
+	if _, err := se.fs.Stat(fp); vfs.IsNotExist(err) {
 		return false
 	}
 	return true
@@ -228,7 +225,8 @@ func (se *SSEnv) HasFlagFile() bool {
 
 // RemoveFlagFile removes the flag file from the final directory.
 func (se *SSEnv) RemoveFlagFile() error {
-	return fileutil.RemoveFlagFile(se.finalDir, fileutil.SnapshotFlagFilename)
+	return fileutil.RemoveFlagFile(se.finalDir,
+		fileutil.SnapshotFlagFilename, se.fs)
 }
 
 // GetFilename returns the snapshot filename.
@@ -238,60 +236,47 @@ func (se *SSEnv) GetFilename() string {
 
 // GetFilepath returns the snapshot file path.
 func (se *SSEnv) GetFilepath() string {
-	return filepath.Join(se.finalDir, getSnapshotFilename(se.index))
+	return se.fs.PathJoin(se.finalDir, getSnapshotFilename(se.index))
 }
 
 // GetShrinkedFilepath returns the file path of the shrunk snapshot.
 func (se *SSEnv) GetShrinkedFilepath() string {
-	return filepath.Join(se.finalDir, getShrinkedSnapshotFilename(se.index))
+	return se.fs.PathJoin(se.finalDir, getShrinkedSnapshotFilename(se.index))
 }
 
 // GetTempFilepath returns the temp snapshot file path.
 func (se *SSEnv) GetTempFilepath() string {
-	return filepath.Join(se.tmpDir, getSnapshotFilename(se.index))
+	return se.fs.PathJoin(se.tmpDir, getSnapshotFilename(se.index))
 }
 
 func (se *SSEnv) createDir(dir string) error {
 	mustBeChild(se.rootDir, dir)
-	return fileutil.Mkdir(dir)
+	return fileutil.Mkdir(dir, se.fs)
 }
 
 func (se *SSEnv) removeDir(dir string) error {
 	mustBeChild(se.rootDir, dir)
-	if err := os.RemoveAll(dir); err != nil {
+	if err := se.fs.RemoveAll(dir); err != nil {
 		return err
 	}
-	return fileutil.SyncDir(se.rootDir)
+	return fileutil.SyncDir(se.rootDir, se.fs)
 }
 
-func (se *SSEnv) isFinalDirExists() bool {
-	if _, err := os.Stat(se.finalDir); os.IsNotExist(err) {
+func (se *SSEnv) finalDirExists() bool {
+	if _, err := se.fs.Stat(se.finalDir); vfs.IsNotExist(err) {
 		return false
 	}
 	return true
 }
 
 func (se *SSEnv) renameTempDirToFinalDir() error {
-	if err := os.Rename(se.tmpDir, se.finalDir); err != nil {
-		if isTargetDirExistError(err) {
-			return ErrSnapshotOutOfDate
-		}
+	if err := se.fs.Rename(se.tmpDir, se.finalDir); err != nil {
 		return err
 	}
-	return fileutil.SyncDir(se.rootDir)
+	return fileutil.SyncDir(se.rootDir, se.fs)
 }
 
-func (se *SSEnv) createFlagFile(msg proto.Message) error {
+func (se *SSEnv) createFlagFile(msg fileutil.Marshaler) error {
 	return fileutil.CreateFlagFile(se.tmpDir,
-		fileutil.SnapshotFlagFilename, msg)
-}
-
-// see rename() in go/src/os/file_unix.go for details
-// checked on golang 1.10/1.11
-func isTargetDirExistError(err error) bool {
-	e, ok := err.(*os.LinkError)
-	if ok {
-		return e.Err == syscall.EEXIST || e.Err == syscall.ENOTEMPTY
-	}
-	return false
+		fileutil.SnapshotFlagFilename, msg, se.fs)
 }

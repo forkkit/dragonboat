@@ -1,20 +1,60 @@
-## v3.2 (TBD)
+## v3.3 (TBD)
 
-Dragonboat v3.2 is a minor release with new features and improvements. All v3.1.x users are recommended to upgrade. 
+Dragonboat v3.3 comes with new features and improvements. All v3.2.x users are recommended to upgrade.
 
 ### New features
 
-- Added snappy compression support for Raft entires and snapshots.
-- C++ binding has been updated to cover all v3.x features. Thanks JasonYuchen for working on that.
+- Pebble has been made the default LogDB storage engine. Dragonboat can now be used with CGO disabled.
+- Added the option to get notified when proposals and config changes are committed.
+
+### Improvements
+
+- Optimized the read index implementation.
+- Made LogDB configurations accessible programmatically.
+- Added protobuf workaround to allow Dragonboat and etcd to be used in the same project.
+
+### Breaking changes
+
+- The signature of config.LogDBFactoryFunc has been changed. Your application is not affected unless it uses a custom LogDB implementation.
+- C++ binding is no longer supported.
+- LevelDB based LogDB is no longer supported.
+
+## v3.2 (2020-03-05)
+
+Dragonboat v3.2 comes with new features and improvements. All v3.1.x users are recommended to upgrade. 
+
+### New features
+
+- Added snappy compression support for Raft entries and snapshots.
+- Added experimental witness support.
+- Added new API to allow LogDB compaction to be manually triggered.
+- Added event listener support to allow users to be notified for certain Raft events.
+- Added system event listener support to allow users to be notified for certain system events.
+- Added Raft related metrics to exported.
+- Added rate limit support to control the maximum bandwidth used for snapshot streaming.
+- Updated the C++ binding to cover all v3.1 features. Thanks JasonYuchen for working on that.
+- Added a virtual filesystem layer to support more filesystem related tests.
+- Added experimental Windows and FreeBSD support.
 
 ### Improvements
 
 - Removed the restriction on max proposal payload size.
+- Re-enabled the range delete support in LogDB.
+- Better handling of concurrent snapshot streams.
+- Extensive testing have been done on a high performance native Go KV store called Pebble.
+- TolerateCorruptedTailRecords is now the default WAL recovery mode in the RocksDB based LogDB.
 
 ### Breaking changes
-There is no breanking change for regular users. However, 
+
+There is no breaking change for regular users. However, 
+
  - If you have built customized transport module implementing the raftio.IRaftRPC interface, there is minor change to the config.RaftRPCFactoryFunc type. See github.com/lni/dragoboat/config/config.go for details.
- - The internal transport module has been updated, it is no longer compatible with earlier versions of dragonboat. 
+ - The default transport module has been updated, it is no longer compatible with earlier versions of dragonboat. 
+ - The default LogDB data format is no longer backward compactible with v3.1 or earlier. 
+
+### Other changes
+
+ - LevelDB support has been marked as depreciated. It will be removed from dragonboat in the next major release. 
 
 ## v3.1 (2019-07-04)
 

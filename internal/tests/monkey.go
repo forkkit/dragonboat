@@ -12,13 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build dragonboat_monkeytest dragonboat_slowtest
+// +build dragonboat_monkeytest
 
 package tests
 
 import (
-	"time"
-
 	"github.com/lni/dragonboat/v3/logger"
 )
 
@@ -31,13 +29,7 @@ var (
 // ReadyToReturnTestKnob is a test knob that returns a boolean value indicating
 // whether the system is being shutdown. In production, this function always
 // return false without check the stopC chan.
-func ReadyToReturnTestKnob(stopC <-chan struct{}, delay bool, pos string) bool {
-	if stopC == nil {
-		return false
-	}
-	if delay {
-		time.Sleep(1000 * time.Millisecond)
-	}
+func ReadyToReturnTestKnob(stopC <-chan struct{}, pos string) bool {
 	select {
 	case <-stopC:
 		plog.Infof("test knob set, returning early before %s", pos)

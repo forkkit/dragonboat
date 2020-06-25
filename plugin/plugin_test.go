@@ -20,8 +20,7 @@ import (
 
 	"github.com/lni/dragonboat/v3"
 	"github.com/lni/dragonboat/v3/config"
-	"github.com/lni/dragonboat/v3/plugin/leveldb"
-	"github.com/lni/dragonboat/v3/plugin/pebble"
+	"github.com/lni/dragonboat/v3/internal/vfs"
 	"github.com/lni/dragonboat/v3/plugin/rocksdb"
 )
 
@@ -37,6 +36,7 @@ func testLogDBPluginCanBeUsed(t *testing.T, f config.LogDBFactoryFunc) {
 		RTTMillisecond: 20,
 		RaftAddress:    "localhost:26000",
 		LogDBFactory:   f,
+		FS:             vfs.DefaultFS,
 	}
 	nh, err := dragonboat.NewNodeHost(nhc)
 	if err != nil {
@@ -46,9 +46,6 @@ func testLogDBPluginCanBeUsed(t *testing.T, f config.LogDBFactoryFunc) {
 }
 
 func TestLogDBPluginsCanBeUsed(t *testing.T) {
+	testLogDBPluginCanBeUsed(t, rocksdb.NewLogDB)
 	testLogDBPluginCanBeUsed(t, rocksdb.NewBatchedLogDB)
-	testLogDBPluginCanBeUsed(t, leveldb.NewBatchedLogDB)
-	testLogDBPluginCanBeUsed(t, leveldb.NewLogDB)
-	testLogDBPluginCanBeUsed(t, pebble.NewBatchedLogDB)
-	testLogDBPluginCanBeUsed(t, pebble.NewLogDB)
 }

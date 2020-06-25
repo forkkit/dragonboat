@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
-// +build !dragonboat_slowtest
-// +build !dragonboat_errorinjectiontest
 
 package dragonboat
 
@@ -138,5 +135,40 @@ func TestLoadedNodes(t *testing.T) {
 	if lns.loaded(2, 3) {
 		t.Errorf("unexpectedly returned true")
 	}
-
 }
+
+/*
+func TestWPRemoveFromPending(t *testing.T) {
+	tests := []struct {
+		length uint64
+		idx    uint64
+	}{
+		{1, 0},
+		{5, 0},
+		{5, 1},
+		{5, 4},
+	}
+	for idx, tt := range tests {
+		w := &workerPool{}
+		for i := uint64(0); i < tt.length; i++ {
+			cid := uint64(1)
+			if i == tt.idx {
+				cid = uint64(0)
+			}
+			r := tsn{task: rsm.Task{ClusterID: cid}}
+			w.pending = append(w.pending, r)
+		}
+		if uint64(len(w.pending)) != tt.length {
+			t.Errorf("unexpected length")
+		}
+		w.removeFromPending(int(tt.idx))
+		if uint64(len(w.pending)) != tt.length-1 {
+			t.Errorf("unexpected length")
+		}
+		for _, p := range w.pending {
+			if p.task.ClusterID == 0 {
+				t.Errorf("%d, pending not removed, %+v", idx, w.pending)
+			}
+		}
+	}
+}*/

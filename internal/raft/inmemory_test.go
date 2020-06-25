@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -511,43 +511,36 @@ func TestInMemMergeSetSaveTo(t *testing.T) {
 }
 
 func TestAppliedLogTo(t *testing.T) {
-	im := inMemory{
-		markerIndex: 5,
-		entries: []pb.Entry{
-			{Index: 5, Term: 5},
-			{Index: 6, Term: 6},
-			{Index: 7, Term: 7},
-			{Index: 8, Term: 8},
-			{Index: 9, Term: 9},
-			{Index: 10, Term: 10},
-		},
-		savedTo: 4,
-	}
 	tests := []struct {
 		appliedTo  uint64
 		length     int
 		firstIndex uint64
 	}{
-		{5, 6, 5},
+		{4, 6, 5},
+		{5, 5, 6},
 		{11, 6, 5},
-		{6, 5, 6},
-		{6, 5, 6},
-		{10, 1, 10},
+		{6, 4, 7},
+		{10, 0, 11},
 	}
 	for idx, tt := range tests {
-		len1 := len(im.entries)
-		im.appliedLogTo(tt.appliedTo)
-		len2 := len(im.entries)
-		if len2 < len1 {
-			if !im.shrunk {
-				t.Errorf("shrunk flag not set")
-			}
+		im := inMemory{
+			markerIndex: 5,
+			entries: []pb.Entry{
+				{Index: 5, Term: 5},
+				{Index: 6, Term: 6},
+				{Index: 7, Term: 7},
+				{Index: 8, Term: 8},
+				{Index: 9, Term: 9},
+				{Index: 10, Term: 10},
+			},
+			savedTo: 4,
 		}
+		im.appliedLogTo(tt.appliedTo)
 		if len(im.entries) != tt.length {
 			t.Errorf("%d, unexpected entry slice len %d, want %d",
 				idx, len(im.entries), tt.length)
 		}
-		if im.entries[0].Index != tt.firstIndex {
+		if len(im.entries) > 0 && im.entries[0].Index != tt.firstIndex {
 			t.Errorf("%d, unexpected first index %d, want %d",
 				idx, im.entries[0].Index, tt.firstIndex)
 		}
@@ -556,14 +549,14 @@ func TestAppliedLogTo(t *testing.T) {
 
 func TestRateLimited(t *testing.T) {
 	tests := []struct {
-		rl      *server.RateLimiter
+		rl      *server.InMemRateLimiter
 		limited bool
 	}{
 		{nil, false},
-		{server.NewRateLimiter(0), false},
-		{server.NewRateLimiter(math.MaxUint64), false},
-		{server.NewRateLimiter(1), true},
-		{server.NewRateLimiter(math.MaxUint64 - 1), true},
+		{server.NewInMemRateLimiter(0), false},
+		{server.NewInMemRateLimiter(math.MaxUint64), false},
+		{server.NewInMemRateLimiter(1), true},
+		{server.NewInMemRateLimiter(math.MaxUint64 - 1), true},
 	}
 	for idx, tt := range tests {
 		im := newInMemory(0, tt.rl)
@@ -574,7 +567,7 @@ func TestRateLimited(t *testing.T) {
 }
 
 func TestRateLimitClearedAfterRestoringSnapshot(t *testing.T) {
-	im := newInMemory(0, server.NewRateLimiter(10000))
+	im := newInMemory(0, server.NewInMemRateLimiter(10000))
 	im.merge([]pb.Entry{{Cmd: make([]byte, 1024)}})
 	if im.rl.Get() == 0 {
 		t.Errorf("log size not updated")
@@ -586,7 +579,7 @@ func TestRateLimitClearedAfterRestoringSnapshot(t *testing.T) {
 }
 
 func TestRateLimitIsUpdatedAfterMergingEntries(t *testing.T) {
-	im := newInMemory(0, server.NewRateLimiter(10000))
+	im := newInMemory(0, server.NewInMemRateLimiter(10000))
 	im.merge([]pb.Entry{{Index: 1, Cmd: make([]byte, 1024)}})
 	logsz := im.rl.Get()
 	ents := []pb.Entry{
@@ -606,19 +599,19 @@ func TestRateLimitIsDecreasedAfterEntriesAreApplied(t *testing.T) {
 		{Index: 3, Cmd: make([]byte, 64)},
 		{Index: 4, Cmd: make([]byte, 128)},
 	}
-	im := newInMemory(2, server.NewRateLimiter(10000))
+	im := newInMemory(2, server.NewInMemRateLimiter(10000))
 	im.merge(ents)
 	if im.rl.Get() != getEntrySliceInMemSize(ents) {
 		t.Errorf("unexpected log size")
 	}
 	for idx := uint64(2); idx < uint64(5); idx++ {
 		im.appliedLogTo(idx)
-		if len(im.entries[1:]) > 0 {
-			if im.entries[1:][0].Index != idx+1 {
+		if len(im.entries) > 0 {
+			if im.entries[0].Index != idx+1 {
 				t.Errorf("alignment error")
 			}
 		}
-		if im.rl.Get() != getEntrySliceInMemSize(im.entries[1:]) {
+		if im.rl.Get() != getEntrySliceInMemSize(im.entries) {
 			t.Errorf("log size not updated")
 		}
 	}
@@ -630,7 +623,7 @@ func TestRateLimitCanBeResetWhenMergingEntries(t *testing.T) {
 		{Index: 3, Cmd: make([]byte, 64)},
 		{Index: 4, Cmd: make([]byte, 128)},
 	}
-	im := newInMemory(2, server.NewRateLimiter(10000))
+	im := newInMemory(2, server.NewInMemRateLimiter(10000))
 	im.merge(ents)
 	ents = []pb.Entry{
 		{Index: 1, Cmd: make([]byte, 16)},
@@ -648,7 +641,7 @@ func TestRateLimitCanBeUpdatedAfterCutAndMergingEntries(t *testing.T) {
 		{Index: 3, Cmd: make([]byte, 64)},
 		{Index: 4, Cmd: make([]byte, 128)},
 	}
-	im := newInMemory(2, server.NewRateLimiter(10000))
+	im := newInMemory(2, server.NewInMemRateLimiter(10000))
 	im.merge(ents)
 	ents = []pb.Entry{
 		{Index: 3, Cmd: make([]byte, 1024)},
@@ -700,5 +693,28 @@ func TestTryResize(t *testing.T) {
 	im.tryResize()
 	if cap(im.entries) == initcap {
 		t.Errorf("cap/len unexpectedly not changed")
+	}
+}
+
+func TestNewEntrySlice(t *testing.T) {
+	tests := []struct {
+		input uint64
+		oCap  uint64
+		oLen  uint64
+	}{
+		{entrySliceSize, entrySliceSize, entrySliceSize},
+		{entrySliceSize - 1, entrySliceSize, entrySliceSize - 1},
+		{entrySliceSize + 1, entrySliceSize + 1, entrySliceSize + 1},
+	}
+	for idx, tt := range tests {
+		ents := make([]pb.Entry, tt.input)
+		im := inMemory{}
+		output := im.newEntrySlice(ents)
+		if uint64(cap(output)) != tt.oCap {
+			t.Errorf("%d, unexpected cap %d, want %d", idx, cap(output), tt.oCap)
+		}
+		if uint64(len(output)) != tt.oLen {
+			t.Errorf("%d, unexpected len %d, want %d", idx, len(output), tt.oLen)
+		}
 	}
 }

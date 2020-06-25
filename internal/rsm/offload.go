@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,6 +27,9 @@ const (
 	// FromCommitWorker indicates that the data store has been loaded by or
 	// offloaded from the commit worker.
 	FromCommitWorker
+	// FromApplyWorker indicates that the data store has been loaded by or
+	// offloaded from the apply worker.
+	FromApplyWorker
 	// FromSnapshotWorker indicates that the data store has been loaded by or
 	// offloaded from the snapshot worker.
 	FromSnapshotWorker
@@ -36,6 +39,7 @@ var fromNames = [...]string{
 	"FromNodeHost",
 	"FromStepWorker",
 	"FromCommitWorker",
+	"FromApplyWorker",
 	"FromSnapshotWorker",
 }
 
@@ -49,14 +53,16 @@ type OffloadedStatus struct {
 	clusterID                   uint64
 	nodeID                      uint64
 	readyToDestroy              bool
-	destroyed                   bool
 	offloadedFromNodeHost       bool
 	offloadedFromStepWorker     bool
 	offloadedFromCommitWorker   bool
+	offloadedFromApplyWorker    bool
 	offloadedFromSnapshotWorker bool
 	loadedByStepWorker          bool
 	loadedByCommitWorker        bool
+	loadedByApplyWorker         bool
 	loadedBySnapshotWorker      bool
+	DestroyedC                  chan struct{}
 }
 
 // ReadyToDestroy returns a boolean value indicating whether the the managed data
@@ -68,12 +74,17 @@ func (o *OffloadedStatus) ReadyToDestroy() bool {
 // Destroyed returns a boolean value indicating whether the belonging object
 // has been destroyed.
 func (o *OffloadedStatus) Destroyed() bool {
-	return o.destroyed
+	select {
+	case <-o.DestroyedC:
+		return true
+	default:
+		return false
+	}
 }
 
 // SetDestroyed set the destroyed flag to be true
 func (o *OffloadedStatus) SetDestroyed() {
-	o.destroyed = true
+	close(o.DestroyedC)
 }
 
 // SetLoaded marks the managed data store as loaded from the specified
@@ -82,6 +93,7 @@ func (o *OffloadedStatus) SetLoaded(from From) {
 	if o.offloadedFromNodeHost {
 		if from == FromStepWorker ||
 			from == FromCommitWorker ||
+			from == FromApplyWorker ||
 			from == FromSnapshotWorker {
 			plog.Panicf("loaded from %v after offloaded from nodehost", from)
 		}
@@ -92,6 +104,8 @@ func (o *OffloadedStatus) SetLoaded(from From) {
 		o.loadedByStepWorker = true
 	} else if from == FromCommitWorker {
 		o.loadedByCommitWorker = true
+	} else if from == FromApplyWorker {
+		o.loadedByApplyWorker = true
 	} else if from == FromSnapshotWorker {
 		o.loadedBySnapshotWorker = true
 	} else {
@@ -108,6 +122,8 @@ func (o *OffloadedStatus) SetOffloaded(from From) {
 		o.offloadedFromStepWorker = true
 	} else if from == FromCommitWorker {
 		o.offloadedFromCommitWorker = true
+	} else if from == FromApplyWorker {
+		o.offloadedFromApplyWorker = true
 	} else if from == FromSnapshotWorker {
 		o.offloadedFromSnapshotWorker = true
 	} else {
@@ -120,12 +136,16 @@ func (o *OffloadedStatus) SetOffloaded(from From) {
 		if !o.loadedByCommitWorker {
 			o.offloadedFromCommitWorker = true
 		}
+		if !o.loadedByApplyWorker {
+			o.offloadedFromApplyWorker = true
+		}
 		if !o.loadedBySnapshotWorker {
 			o.offloadedFromSnapshotWorker = true
 		}
 	}
 	if o.offloadedFromNodeHost &&
 		o.offloadedFromCommitWorker &&
+		o.offloadedFromApplyWorker &&
 		o.offloadedFromSnapshotWorker &&
 		o.offloadedFromStepWorker {
 		o.readyToDestroy = true

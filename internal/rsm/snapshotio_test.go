@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,11 +19,11 @@ import (
 	"encoding/binary"
 	"io"
 	"math/rand"
-	"os"
-	"path/filepath"
 	"testing"
 
+	"github.com/lni/dragonboat/v3/internal/vfs"
 	pb "github.com/lni/dragonboat/v3/raftpb"
+	gvfs "github.com/lni/goutils/vfs"
 )
 
 const (
@@ -32,71 +32,85 @@ const (
 	testSnapshotFilename        = "testsnapshot_safe_to_delete.tmp"
 )
 
+func reportLeakedFD(fs vfs.IFS, t *testing.T) {
+	gvfs.ReportLeakedFD(fs, t)
+}
+
 func TestSnapshotWriterCanBeCreated(t *testing.T) {
-	w, err := NewSnapshotWriter(testSnapshotFilename, SnapshotVersion, pb.NoCompression)
+	fs := vfs.GetTestFS()
+	w, err := NewSnapshotWriter(testSnapshotFilename,
+		SnapshotVersion, pb.NoCompression, fs)
 	if err != nil {
 		t.Fatalf("failed to create snapshot writer %v", err)
 	}
-	defer os.RemoveAll(testSnapshotFilename)
+	defer func() {
+		if err := fs.RemoveAll(testSnapshotFilename); err != nil {
+			t.Fatalf("%v", err)
+		}
+	}()
 	defer w.Close()
-	pos, err := w.file.Seek(0, 1)
-	if err != nil {
-		t.Fatalf("%v", err)
-	}
-	if uint64(pos) != SnapshotHeaderSize {
-		t.Errorf("unexpected file position")
-	}
 }
 
 func TestSaveHeaderSavesTheHeader(t *testing.T) {
-	w, err := NewSnapshotWriter(testSnapshotFilename, SnapshotVersion, pb.NoCompression)
-	if err != nil {
-		t.Fatalf("failed to create snapshot writer %v", err)
-	}
-	defer os.RemoveAll(testSnapshotFilename)
-	sessionData := make([]byte, testSessionSize)
-	storeData := make([]byte, testPayloadSize)
-	rand.Read(sessionData)
-	rand.Read(storeData)
-	n, err := w.Write(sessionData)
-	if err != nil || n != len(sessionData) {
-		t.Fatalf("failed to write the session data")
-	}
-	m, err := w.Write(storeData)
-	if err != nil || m != len(storeData) {
-		t.Fatalf("failed to write the store data")
-	}
-	err = w.Close()
-	if err != nil {
-		t.Fatalf("%v", err)
-	}
-	r, err := NewSnapshotReader(testSnapshotFilename)
-	if err != nil {
-		t.Fatalf("%v", err)
-	}
-	defer r.Close()
-	header, err := r.GetHeader()
-	if err != nil {
-		t.Fatalf("%v", err)
-	}
-	if header.Version != uint64(SnapshotVersion) {
-		t.Errorf("invalid version %d, want %d",
-			header.Version, SnapshotVersion)
-	}
-	if header.ChecksumType != DefaultChecksumType {
-		t.Errorf("unexpected checksum type %d, want %d",
-			header.ChecksumType, DefaultChecksumType)
-	}
-	storeChecksum := w.vw.GetPayloadSum()
-	if !bytes.Equal(header.PayloadChecksum, storeChecksum) {
-		t.Errorf("data store checksum mismatch")
-	}
+	fs := vfs.GetTestFS()
+	defer func() {
+		if err := fs.RemoveAll(testSnapshotFilename); err != nil {
+			t.Fatalf("%v", err)
+		}
+	}()
+	func() {
+		w, err := NewSnapshotWriter(testSnapshotFilename,
+			SnapshotVersion, pb.NoCompression, fs)
+		if err != nil {
+			t.Fatalf("failed to create snapshot writer %v", err)
+		}
+		sessionData := make([]byte, testSessionSize)
+		storeData := make([]byte, testPayloadSize)
+		rand.Read(sessionData)
+		rand.Read(storeData)
+		n, err := w.Write(sessionData)
+		if err != nil || n != len(sessionData) {
+			t.Fatalf("failed to write the session data")
+		}
+		m, err := w.Write(storeData)
+		if err != nil || m != len(storeData) {
+			t.Fatalf("failed to write the store data")
+		}
+		err = w.Close()
+		if err != nil {
+			t.Fatalf("%v", err)
+		}
+		r, err := NewSnapshotReader(testSnapshotFilename, fs)
+		if err != nil {
+			t.Fatalf("%v", err)
+		}
+		defer r.Close()
+		header, err := r.GetHeader()
+		if err != nil {
+			t.Fatalf("%v", err)
+		}
+		if header.Version != uint64(SnapshotVersion) {
+			t.Errorf("invalid version %d, want %d",
+				header.Version, SnapshotVersion)
+		}
+		if header.ChecksumType != DefaultChecksumType {
+			t.Errorf("unexpected checksum type %d, want %d",
+				header.ChecksumType, DefaultChecksumType)
+		}
+		storeChecksum := w.vw.GetPayloadSum()
+		if !bytes.Equal(header.PayloadChecksum, storeChecksum) {
+			t.Errorf("data store checksum mismatch")
+		}
+	}()
+	reportLeakedFD(fs, t)
 }
 
 func makeTestSnapshotFile(t *testing.T, ssz uint64,
-	psz uint64, v SSVersion) (*SnapshotWriter, []byte, []byte) {
-	os.RemoveAll(testSnapshotFilename)
-	w, err := NewSnapshotWriter(testSnapshotFilename, v, pb.NoCompression)
+	psz uint64, v SSVersion, fs vfs.IFS) (*SnapshotWriter, []byte, []byte) {
+	if err := fs.RemoveAll(testSnapshotFilename); err != nil {
+		t.Fatalf("%v", err)
+	}
+	w, err := NewSnapshotWriter(testSnapshotFilename, v, pb.NoCompression, fs)
 	if err != nil {
 		t.Fatalf("failed to create snapshot writer %v", err)
 	}
@@ -118,113 +132,126 @@ func makeTestSnapshotFile(t *testing.T, ssz uint64,
 	return w, sessionData, storeData
 }
 
-func corruptSnapshotPayload(t *testing.T) {
-	f, err := os.OpenFile(testSnapshotFilename, os.O_RDWR, 0755)
-	if err != nil {
-		t.Fatalf("%v", err)
-	}
-	s := (testSessionSize + testPayloadSize) / 2
-	if _, err := f.Seek(int64(SnapshotHeaderSize+s), 0); err != nil {
-		t.Fatalf("%v", err)
-	}
-	data := make([]byte, 1)
-	if _, err := f.Read(data); err != nil {
-		t.Fatalf("%v", err)
-	}
-	data[0] = byte(data[0] + 1)
-	if _, err := f.Seek(int64(SnapshotHeaderSize+s), 0); err != nil {
-		t.Fatalf("%v", err)
-	}
-	if _, err := f.Write(data); err != nil {
-		t.Fatalf("%v", err)
-	}
-	if err := f.Close(); err != nil {
+func corruptSnapshotPayload(t *testing.T, fs vfs.IFS) {
+	tmpFp := "testsnapshot.writing"
+	func() {
+		f, err := fs.ReuseForWrite(testSnapshotFilename, tmpFp)
+		if err != nil {
+			t.Fatalf("%v", err)
+		}
+		defer f.Close()
+		s := (testSessionSize + testPayloadSize) / 2
+		data := make([]byte, 1)
+		if _, err := f.ReadAt(data, int64(SnapshotHeaderSize+s)); err != nil {
+			t.Fatalf("%v", err)
+		}
+		data[0] = byte(data[0] + 1)
+		if _, err := f.WriteAt(data, int64(SnapshotHeaderSize+s)); err != nil {
+			t.Fatalf("%v", err)
+		}
+	}()
+	if err := fs.Rename(tmpFp, testSnapshotFilename); err != nil {
 		t.Fatalf("%v", err)
 	}
 }
 
 func createTestSnapshotFile(t *testing.T,
-	v SSVersion) (*SnapshotWriter, []byte, []byte) {
-	return makeTestSnapshotFile(t, testSessionSize, testPayloadSize, v)
+	v SSVersion, fs vfs.IFS) (*SnapshotWriter, []byte, []byte) {
+	return makeTestSnapshotFile(t, testSessionSize, testPayloadSize, v, fs)
 }
 
-func testCorruptedPayloadWillBeDetected(t *testing.T, v SSVersion) {
-	createTestSnapshotFile(t, v)
-	corruptSnapshotPayload(t)
-	defer os.RemoveAll(testSnapshotFilename)
+func testCorruptedPayloadWillBeDetected(t *testing.T, v SSVersion, fs vfs.IFS) {
 	defer func() {
-		if r := recover(); r == nil {
-			t.Fatalf("validation error not reported")
+		if err := fs.RemoveAll(testSnapshotFilename); err != nil {
+			t.Fatalf("%v", err)
 		}
 	}()
-
-	r, err := NewSnapshotReader(testSnapshotFilename)
-	if err != nil {
-		t.Fatalf("%v", err)
-	}
-	defer r.Close()
-	header, err := r.GetHeader()
-	if err != nil {
-		t.Fatalf("%v", err)
-	}
-	rand.Read(header.PayloadChecksum)
-	s := make([]byte, testSessionSize)
-	p := make([]byte, testPayloadSize)
-	n, err := io.ReadFull(r, s)
-	if uint64(n) != testSessionSize || err != nil {
-		t.Fatalf("failed to get session data %d, %d, %v",
-			uint64(n), testSessionSize, err)
-	}
-	n, err = io.ReadFull(r, p)
-	if uint64(n) != testPayloadSize || err != nil {
-		t.Fatalf("failed to get payload data")
-	}
-	r.ValidatePayload(header)
+	func() {
+		createTestSnapshotFile(t, v, fs)
+		corruptSnapshotPayload(t, fs)
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("validation error not reported")
+			}
+		}()
+		r, err := NewSnapshotReader(testSnapshotFilename, fs)
+		if err != nil {
+			t.Fatalf("%v", err)
+		}
+		defer r.Close()
+		header, err := r.GetHeader()
+		if err != nil {
+			t.Fatalf("%v", err)
+		}
+		rand.Read(header.PayloadChecksum)
+		s := make([]byte, testSessionSize)
+		p := make([]byte, testPayloadSize)
+		n, err := io.ReadFull(r, s)
+		if uint64(n) != testSessionSize || err != nil {
+			t.Fatalf("failed to get session data %d, %d, %v",
+				uint64(n), testSessionSize, err)
+		}
+		n, err = io.ReadFull(r, p)
+		if uint64(n) != testPayloadSize || err != nil {
+			t.Fatalf("failed to get payload data")
+		}
+		r.ValidatePayload(header)
+	}()
+	reportLeakedFD(fs, t)
 }
 
 func TestCorruptedPayloadWillBeDetected(t *testing.T) {
-	testCorruptedPayloadWillBeDetected(t, V1SnapshotVersion)
-	testCorruptedPayloadWillBeDetected(t, V2SnapshotVersion)
+	fs := vfs.GetTestFS()
+	testCorruptedPayloadWillBeDetected(t, V1SnapshotVersion, fs)
+	testCorruptedPayloadWillBeDetected(t, V2SnapshotVersion, fs)
 }
 
-func testNormalSnapshotCanPassValidation(t *testing.T, v SSVersion) {
-	_, sessionData, storeData := createTestSnapshotFile(t, v)
-	defer os.RemoveAll(testSnapshotFilename)
-	r, err := NewSnapshotReader(testSnapshotFilename)
-	if err != nil {
-		t.Fatalf("%v", err)
-	}
-	defer r.Close()
-	header, err := r.GetHeader()
-	if err != nil {
-		t.Fatalf("%v", err)
-	}
-	s := make([]byte, testSessionSize)
-	p := make([]byte, testPayloadSize)
-	n, err := io.ReadFull(r, s)
-	if uint64(n) != testSessionSize || err != nil {
-		t.Fatalf("failed to get session data")
-	}
-	n, err = io.ReadFull(r, p)
-	if uint64(n) != testPayloadSize || err != nil {
-		t.Fatalf("failed to get payload data")
-	}
-	r.ValidatePayload(header)
-	if !bytes.Equal(sessionData, s) {
-		t.Errorf("session data changed")
-	}
-	if !bytes.Equal(storeData, p) {
-		t.Errorf("store data changed")
-	}
+func testNormalSnapshotCanPassValidation(t *testing.T, v SSVersion, fs vfs.IFS) {
+	defer func() {
+		if err := fs.RemoveAll(testSnapshotFilename); err != nil {
+			t.Fatalf("%v", err)
+		}
+	}()
+	func() {
+		_, sessionData, storeData := createTestSnapshotFile(t, v, fs)
+		r, err := NewSnapshotReader(testSnapshotFilename, fs)
+		if err != nil {
+			t.Fatalf("%v", err)
+		}
+		defer r.Close()
+		header, err := r.GetHeader()
+		if err != nil {
+			t.Fatalf("%v", err)
+		}
+		s := make([]byte, testSessionSize)
+		p := make([]byte, testPayloadSize)
+		n, err := io.ReadFull(r, s)
+		if uint64(n) != testSessionSize || err != nil {
+			t.Fatalf("failed to get session data")
+		}
+		n, err = io.ReadFull(r, p)
+		if uint64(n) != testPayloadSize || err != nil {
+			t.Fatalf("failed to get payload data")
+		}
+		r.ValidatePayload(header)
+		if !bytes.Equal(sessionData, s) {
+			t.Errorf("session data changed")
+		}
+		if !bytes.Equal(storeData, p) {
+			t.Errorf("store data changed")
+		}
+	}()
+	reportLeakedFD(fs, t)
 }
 
 func TestNormalSnapshotCanPassValidation(t *testing.T) {
-	testNormalSnapshotCanPassValidation(t, V1SnapshotVersion)
-	testNormalSnapshotCanPassValidation(t, V2SnapshotVersion)
+	fs := vfs.GetTestFS()
+	testNormalSnapshotCanPassValidation(t, V1SnapshotVersion, fs)
+	testNormalSnapshotCanPassValidation(t, V2SnapshotVersion, fs)
 }
 
-func readTestSnapshot(fn string, sz uint64) ([]byte, error) {
-	file, err := os.Open(fn)
+func readTestSnapshot(fn string, sz uint64, fs vfs.IFS) ([]byte, error) {
+	file, err := fs.Open(fn)
 	if err != nil {
 		return nil, err
 	}
@@ -237,10 +264,14 @@ func readTestSnapshot(fn string, sz uint64) ([]byte, error) {
 	return data[:n], nil
 }
 
-func testSingleBlockSnapshotValidation(t *testing.T, sv SSVersion) {
-	createTestSnapshotFile(t, sv)
-	defer os.RemoveAll(testSnapshotFilename)
-	data, err := readTestSnapshot(testSnapshotFilename, 1024*1024)
+func testSingleBlockSnapshotValidation(t *testing.T, sv SSVersion, fs vfs.IFS) {
+	createTestSnapshotFile(t, sv, fs)
+	defer func() {
+		if err := fs.RemoveAll(testSnapshotFilename); err != nil {
+			t.Fatalf("%v", err)
+		}
+	}()
+	data, err := readTestSnapshot(testSnapshotFilename, 1024*1024, fs)
 	if err != nil {
 		t.Fatalf("failed to get snapshot data %v", err)
 	}
@@ -263,17 +294,23 @@ func testSingleBlockSnapshotValidation(t *testing.T, sv SSVersion) {
 	if v.Validate() {
 		t.Fatalf("validation failed to picked up corrupted data")
 	}
+	reportLeakedFD(fs, t)
 }
 
 func TestSingleBlockSnapshotValidation(t *testing.T) {
-	testSingleBlockSnapshotValidation(t, V1SnapshotVersion)
-	testSingleBlockSnapshotValidation(t, V2SnapshotVersion)
+	fs := vfs.GetTestFS()
+	testSingleBlockSnapshotValidation(t, V1SnapshotVersion, fs)
+	testSingleBlockSnapshotValidation(t, V2SnapshotVersion, fs)
 }
 
-func testMultiBlockSnapshotValidation(t *testing.T, sv SSVersion) {
-	makeTestSnapshotFile(t, 1024*1024, 1024*1024*8, sv)
-	defer os.RemoveAll(testSnapshotFilename)
-	data, err := readTestSnapshot(testSnapshotFilename, 1024*1024*10)
+func testMultiBlockSnapshotValidation(t *testing.T, sv SSVersion, fs vfs.IFS) {
+	makeTestSnapshotFile(t, 1024*1024, 1024*1024*8, sv, fs)
+	defer func() {
+		if err := fs.RemoveAll(testSnapshotFilename); err != nil {
+			t.Fatalf("%v", err)
+		}
+	}()
+	data, err := readTestSnapshot(testSnapshotFilename, 1024*1024*10, fs)
 	if err != nil {
 		t.Fatalf("failed to get snapshot data %v", err)
 	}
@@ -300,14 +337,17 @@ func testMultiBlockSnapshotValidation(t *testing.T, sv SSVersion) {
 	if v.Validate() {
 		t.Fatalf("validation failed to pick up the corrupted snapshot")
 	}
+	reportLeakedFD(fs, t)
 }
 
 func TestMultiBlockSnapshotValidation(t *testing.T) {
-	testMultiBlockSnapshotValidation(t, V1SnapshotVersion)
-	testMultiBlockSnapshotValidation(t, V2SnapshotVersion)
+	fs := vfs.GetTestFS()
+	testMultiBlockSnapshotValidation(t, V1SnapshotVersion, fs)
+	testMultiBlockSnapshotValidation(t, V2SnapshotVersion, fs)
 }
 
 func TestMustInSameDir(t *testing.T) {
+	fs := vfs.GetTestFS()
 	tests := []struct {
 		path1   string
 		path2   string
@@ -328,20 +368,24 @@ func TestMustInSameDir(t *testing.T) {
 					t.Errorf("%d, failed to detect not same dir", idx)
 				}
 			}()
-			mustInSameDir(tt.path1, tt.path2)
+			mustInSameDir(tt.path1, tt.path2, fs)
 		}()
 	}
 }
 
 func TestShrinkSnapshot(t *testing.T) {
+	fs := vfs.GetTestFS()
 	snapshotFilename := "test_snapshot_safe_to_delete.data"
 	shrunkFilename := "test_snapshot_safe_to_delete.shrunk"
-	writer, err := NewSnapshotWriter(snapshotFilename, V2SnapshotVersion, pb.NoCompression)
+	writer, err := NewSnapshotWriter(snapshotFilename,
+		V2SnapshotVersion, pb.NoCompression, fs)
 	if err != nil {
 		t.Fatalf("failed to get writer %v", err)
 	}
 	defer func() {
-		os.RemoveAll(snapshotFilename)
+		if err := fs.RemoveAll(snapshotFilename); err != nil {
+			t.Fatalf("%v", err)
+		}
 	}()
 	sz := make([]byte, 8)
 	binary.LittleEndian.PutUint64(sz, uint64(0))
@@ -358,54 +402,61 @@ func TestShrinkSnapshot(t *testing.T) {
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close failed %v", err)
 	}
-	shrunk, err := IsShrinkedSnapshotFile(snapshotFilename)
+	shrunk, err := IsShrinkedSnapshotFile(snapshotFilename, fs)
 	if err != nil {
 		t.Fatalf("failed to check whether snapshot file is shrunk %v", err)
 	}
 	if shrunk {
 		t.Errorf("incorrectly reported as shrunk")
 	}
-	if err := ShrinkSnapshot(snapshotFilename, shrunkFilename); err != nil {
+	if err := ShrinkSnapshot(snapshotFilename, shrunkFilename, fs); err != nil {
 		t.Errorf("failed to shrink snapshot %v", err)
 	}
 	defer func() {
-		os.RemoveAll(shrunkFilename)
+		if err := fs.RemoveAll(shrunkFilename); err != nil {
+			t.Fatalf("%v", err)
+		}
 	}()
-	shrunk, err = IsShrinkedSnapshotFile(snapshotFilename)
+	shrunk, err = IsShrinkedSnapshotFile(snapshotFilename, fs)
 	if err != nil {
 		t.Fatalf("failed to check whether snapshot file is shrunk %v", err)
 	}
 	if shrunk {
 		t.Errorf("incorrectly reported as shrunk")
 	}
-	shrunk, err = IsShrinkedSnapshotFile(shrunkFilename)
+	shrunk, err = IsShrinkedSnapshotFile(shrunkFilename, fs)
 	if err != nil {
 		t.Fatalf("failed to check whether snapshot file is shrunk %v", err)
 	}
 	if !shrunk {
 		t.Errorf("not shrunk")
 	}
-	fi, err := os.Stat(shrunkFilename)
+	fi, err := fs.Stat(shrunkFilename)
 	if err != nil {
 		t.Fatalf("failed to get file stat")
 	}
 	if fi.Size() != 1060 {
 		t.Errorf("not shrunk according to file size")
 	}
-	reader, err := NewSnapshotReader(shrunkFilename)
+	reader, err := NewSnapshotReader(shrunkFilename, fs)
 	if err != nil {
 		t.Fatalf("failed to create snapshot reader %v", err)
 	}
 	if _, err := reader.GetHeader(); err != nil {
 		t.Fatalf("failed to get header %v", err)
 	}
+	if err := reader.Close(); err != nil {
+		t.Fatalf("failed to close the reader %v", err)
+	}
+	reportLeakedFD(fs, t)
 }
 
 func TestReplaceSnapshotFile(t *testing.T) {
+	fs := vfs.GetTestFS()
 	f1name := "test_snapshot_safe_to_delete.data"
 	f2name := "test_snapshot_safe_to_delete.data2"
 	createFile := func(fn string, sz uint64) {
-		f1, err := os.Create(fn)
+		f1, err := fs.Create(fn)
 		if err != nil {
 			t.Fatalf("failed to ")
 		}
@@ -421,17 +472,21 @@ func TestReplaceSnapshotFile(t *testing.T) {
 	createFile(f1name, 1024)
 	createFile(f2name, 2048)
 	defer func() {
-		os.RemoveAll(f1name)
-		os.RemoveAll(f2name)
+		if err := fs.RemoveAll(f1name); err != nil {
+			t.Fatalf("%v", err)
+		}
+		if err := fs.RemoveAll(f2name); err != nil {
+			t.Fatalf("%v", err)
+		}
 	}()
-	if err := ReplaceSnapshotFile(f2name, f1name); err != nil {
+	if err := ReplaceSnapshotFile(f2name, f1name, fs); err != nil {
 		t.Fatalf("failed to replace file %v", err)
 	}
-	_, err := os.Stat(f2name)
+	_, err := fs.Stat(f2name)
 	if err == nil {
 		t.Errorf("f2 still exist")
 	}
-	fi, err := os.Stat(f1name)
+	fi, err := fs.Stat(f1name)
 	if err != nil {
 		t.Errorf("failed to get file info %v", err)
 	}
@@ -440,44 +495,56 @@ func TestReplaceSnapshotFile(t *testing.T) {
 	}
 }
 
-func testV2PayloadChecksumCanBeRead(t *testing.T, sz uint64) {
-	makeTestSnapshotFile(t, 0, sz, V2SnapshotVersion)
-	defer os.RemoveAll(testSnapshotFilename)
-	reader, err := NewSnapshotReader(testSnapshotFilename)
-	if err != nil {
-		t.Fatalf("failed to create reader %v", err)
-	}
+func testV2PayloadChecksumCanBeRead(t *testing.T, sz uint64, fs vfs.IFS) {
 	defer func() {
-		reader.Close()
+		if err := fs.RemoveAll(testSnapshotFilename); err != nil {
+			t.Fatalf("%v", err)
+		}
 	}()
-	header, err := reader.GetHeader()
-	if err != nil {
-		t.Fatalf("failed to get header")
-	}
-	crc, err := GetV2PayloadChecksum(testSnapshotFilename)
-	if err != nil {
-		t.Fatalf("failed to get v2 payload checksum %v", err)
-	}
-	if !bytes.Equal(crc, header.PayloadChecksum) {
-		t.Fatalf("crc changed")
-	}
+	func() {
+		makeTestSnapshotFile(t, 0, sz, V2SnapshotVersion, fs)
+		reader, err := NewSnapshotReader(testSnapshotFilename, fs)
+		if err != nil {
+			t.Fatalf("failed to create reader %v", err)
+		}
+		defer func() {
+			reader.Close()
+		}()
+		header, err := reader.GetHeader()
+		if err != nil {
+			t.Fatalf("failed to get header")
+		}
+		crc, err := GetV2PayloadChecksum(testSnapshotFilename, fs)
+		if err != nil {
+			t.Fatalf("failed to get v2 payload checksum %v", err)
+		}
+		if !bytes.Equal(crc, header.PayloadChecksum) {
+			t.Fatalf("crc changed")
+		}
+	}()
+	reportLeakedFD(fs, t)
 }
 
 func TestV2PayloadChecksumCanBeRead(t *testing.T) {
-	testV2PayloadChecksumCanBeRead(t, snapshotBlockSize-1)
-	testV2PayloadChecksumCanBeRead(t, snapshotBlockSize)
-	testV2PayloadChecksumCanBeRead(t, snapshotBlockSize+1)
-	testV2PayloadChecksumCanBeRead(t, snapshotBlockSize*3-1)
-	testV2PayloadChecksumCanBeRead(t, snapshotBlockSize*3)
-	testV2PayloadChecksumCanBeRead(t, snapshotBlockSize*3+1)
+	fs := vfs.GetTestFS()
+	testV2PayloadChecksumCanBeRead(t, snapshotBlockSize-1, fs)
+	testV2PayloadChecksumCanBeRead(t, snapshotBlockSize, fs)
+	testV2PayloadChecksumCanBeRead(t, snapshotBlockSize+1, fs)
+	testV2PayloadChecksumCanBeRead(t, snapshotBlockSize*3-1, fs)
+	testV2PayloadChecksumCanBeRead(t, snapshotBlockSize*3, fs)
+	testV2PayloadChecksumCanBeRead(t, snapshotBlockSize*3+1, fs)
 }
 
 func TestV1SnapshotCanBeLoaded(t *testing.T) {
 	// rsm: idList sz 2
 	// rsm: client id 15771809973567514624, responded to 4, map[5:128]
 	// rsm: client id 6760681031265190231, responded to 2, map[3:128]
-	fp := filepath.Join("testdata", "v1snapshot.gbsnap")
-	reader, err := NewSnapshotReader(fp)
+	fs := vfs.GetTestFS()
+	if fs != vfs.DefaultFS {
+		t.Skip("skipped, the fs can not access the testdata")
+	}
+	fp := fs.PathJoin("testdata", "v1snapshot.gbsnap")
+	reader, err := NewSnapshotReader(fp, fs)
 	if err != nil {
 		t.Fatalf("failed to get reader %v", err)
 	}

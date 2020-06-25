@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -47,13 +47,13 @@ type ILogDB interface {
 	GetRange() (uint64, uint64)
 	// SetRange updates the ILogDB to extend the entry range known to the ILogDB.
 	SetRange(index uint64, length uint64)
-	// NodeState returns the state of the node persistented in LogDB.
+	// NodeState returns the state of the node persistent in LogDB.
 	NodeState() (pb.State, pb.Membership)
 	// SetState sets the persistent state known to ILogDB.
 	SetState(ps pb.State)
 	// CreateSnapshot sets the snapshot known to ILogDB
 	CreateSnapshot(ss pb.Snapshot) error
-	// ApplySnapshot makes the sbapshot known to ILogDB and also update the entry
+	// ApplySnapshot makes the snapshot known to ILogDB and also update the entry
 	// range known to ILogDB.
 	ApplySnapshot(ss pb.Snapshot) error
 	// Term returns the entry term of the specified entry.
@@ -83,7 +83,7 @@ type entryLog struct {
 	processed uint64
 }
 
-func newEntryLog(logdb ILogDB, rl *server.RateLimiter) *entryLog {
+func newEntryLog(logdb ILogDB, rl *server.InMemRateLimiter) *entryLog {
 	firstIndex, lastIndex := logdb.GetRange()
 	l := &entryLog{
 		logdb:     logdb,
@@ -99,6 +99,7 @@ func (l *entryLog) firstIndex() uint64 {
 	if ok {
 		return index + 1
 	}
+
 	index, _ = l.logdb.GetRange()
 	return index
 }
@@ -108,6 +109,7 @@ func (l *entryLog) lastIndex() uint64 {
 	if ok {
 		return index
 	}
+
 	_, index = l.logdb.GetRange()
 	return index
 }
@@ -146,6 +148,7 @@ func (l *entryLog) term(index uint64) (uint64, error) {
 	if t, ok := l.inmem.getTerm(index); ok {
 		return t, nil
 	}
+
 	t, err := l.logdb.Term(index)
 	if err != nil && err != ErrCompacted && err != ErrUnavailable {
 		panic(err)
@@ -184,6 +187,7 @@ func (l *entryLog) getEntriesFromLogDB(low uint64,
 	if low >= l.inmem.markerIndex {
 		return nil, true, nil
 	}
+
 	upperBound := min(high, l.inmem.markerIndex)
 	ents, err := l.logdb.Entries(low, upperBound, maxSize)
 	if err == ErrCompacted {
@@ -389,7 +393,6 @@ func (l *entryLog) tryCommit(index uint64, term uint64) bool {
 }
 
 func (l *entryLog) restore(s pb.Snapshot) {
-	plog.Infof("applying snapshot %d,%d", s.Index, s.Term)
 	l.inmem.restore(s)
 	l.committed = s.Index
 	l.processed = s.Index

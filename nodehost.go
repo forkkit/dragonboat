@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -86,11 +86,15 @@ package dragonboat // github.com/lni/dragonboat/v3
 import (
 	"context"
 	"errors"
+	"math"
 	"reflect"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/lni/goutils/logutil"
+	"github.com/lni/goutils/syncutil"
 
 	"github.com/lni/dragonboat/v3/client"
 	"github.com/lni/dragonboat/v3/config"
@@ -99,19 +103,17 @@ import (
 	"github.com/lni/dragonboat/v3/internal/server"
 	"github.com/lni/dragonboat/v3/internal/settings"
 	"github.com/lni/dragonboat/v3/internal/transport"
+	"github.com/lni/dragonboat/v3/internal/vfs"
 	"github.com/lni/dragonboat/v3/raftio"
 	pb "github.com/lni/dragonboat/v3/raftpb"
 	sm "github.com/lni/dragonboat/v3/statemachine"
-	"github.com/lni/goutils/logutil"
-	"github.com/lni/goutils/syncutil"
 )
 
 const (
-	unmanagedDeploymentID = transport.UnmanagedDeploymentID
 	// DragonboatMajor is the major version number
 	DragonboatMajor = 3
 	// DragonboatMinor is the minor version number
-	DragonboatMinor = 2
+	DragonboatMinor = 3
 	// DragonboatPatch is the patch version number
 	DragonboatPatch = 0
 	// DEVVersion is a boolean flag indicating whether this is a dev version
@@ -120,8 +122,7 @@ const (
 
 var (
 	receiveQueueLen   = settings.Soft.ReceiveQueueLength
-	delaySampleRatio  = settings.Soft.LatencySampleRatio
-	rsPoolSize        = settings.Soft.NodeHostSyncPoolSize
+	rsPoolShards      = settings.Soft.NodeHostRequestStatePoolShards
 	streamConnections = settings.Soft.StreamConnections
 	monitorInterval   = 100 * time.Millisecond
 )
@@ -139,6 +140,14 @@ var (
 	// ErrInvalidClusterSettings indicates that cluster settings specified for
 	// the StartCluster method are invalid.
 	ErrInvalidClusterSettings = errors.New("cluster settings are invalid")
+	// ErrClusterNotBootstrapped indicates that the specified cluster has not
+	// been boostrapped yet. When starting this node, depending on whether this
+	// node is an initial member of the Raft cluster, you must either specify
+	// all of its initial members or set the join flag to true.
+	// When used correctly, dragonboat only returns this error in the rare
+	// situation when you try to restart a node crashed during its previous
+	// bootstrap attempt.
+	ErrClusterNotBootstrapped = errors.New("cluster not bootstrapped")
 	// ErrDeadlineNotSet indicates that the context parameter provided does not
 	// carry a deadline.
 	ErrDeadlineNotSet = errors.New("deadline not set")
@@ -156,18 +165,23 @@ type ClusterInfo struct {
 	ClusterID uint64
 	// NodeID is the node ID of the Raft cluster node.
 	NodeID uint64
-	// IsLeader indicates whether this is a leader node.
-	IsLeader bool
-	// IsObserver indicates whether this is a non-voting observer node.
-	IsObserver bool
-	// StateMachineType is the type of the state machine.
-	StateMachineType sm.Type
 	// Nodes is a map of member node IDs to their Raft addresses.
 	Nodes map[uint64]string
 	// ConfigChangeIndex is the current config change index of the Raft node.
 	// ConfigChangeIndex is Raft Log index of the last applied membership
 	// change entry.
 	ConfigChangeIndex uint64
+	// StateMachineType is the type of the state machine.
+	StateMachineType sm.Type
+	// Pending is a boolean flag indicating whether details of the cluster node
+	// is not available. The Pending flag is set to true usually because the node
+	// has not had anything applied yet.
+	// IsLeader indicates whether this is a leader node.
+	IsLeader bool
+	// IsObserver indicates whether this is a non-voting observer node.
+	IsObserver bool
+	// IsWitness indicates whether this is a witness node without actual log.
+	IsWitness bool
 	// Pending is a boolean flag indicating whether details of the cluster node
 	// is not available. The Pending flag is set to true usually because the node
 	// has not had anything applied yet.
@@ -200,25 +214,24 @@ var DefaultNodeHostInfoOption NodeHostInfoOption
 // SnapshotOption is the options users can specify when requesting a snapshot
 // to be generated.
 type SnapshotOption struct {
+	// CompactionOverhead is the compaction overhead value to use for the request
+	// snapshot operation when OverrideCompactionOverhead is true. This field is
+	// ignored when exporting a snapshot, that is when Exported is true.
+	CompactionOverhead uint64
+	// ExportPath is the path where the exported snapshot should be stored, it
+	// must point to an existing directory for which the current user has write
+	// permission to it.
+	ExportPath string
 	// Exported is a boolean flag indicating whether the snapshot requested to
 	// be generated should be exported. For an exported snapshot, it is users'
 	// responsibility to manage the snapshot files. By default, a requested
 	// snapshot is not considered as exported, such a regular snapshot is managed
 	// the system.
 	Exported bool
-	// ExportPath is the path where the exported snapshot should be stored, it
-	// must point to an existing directory for which the current user has write
-	// permission to it.
-	ExportPath string
 	// OverrideCompactionOverhead defines whether the requested snapshot operation
 	// should override the compaction overhead setting specified in node's config.
-	// This field is ignored by the system when exporting a snapshot, that is when
-	// Exported is true.
+	// This field is ignored by the system when exporting a snapshot.
 	OverrideCompactionOverhead bool
-	// CompactionOverhead is the compaction overhead value to use for the request
-	// snapshot operation when OverrideCompactionOverhead is true. This field is
-	// ignored when exporting a snapshot, that is when Exported is true.
-	CompactionOverhead uint64
 }
 
 // DefaultSnapshotOption is the default SnapshotOption value to use when
@@ -231,8 +244,7 @@ var DefaultSnapshotOption SnapshotOption
 // transport and persistent storage etc. NodeHost is also the central access
 // point for Dragonboat functionalities provided to applications.
 type NodeHost struct {
-	tick     uint64
-	msgCount uint64
+	tick uint64
 	testPartitionState
 	clusterMu struct {
 		sync.RWMutex
@@ -241,21 +253,21 @@ type NodeHost struct {
 		clusters sync.Map
 		requests map[uint64]*server.MessageQueue
 	}
-	snapshotStatus   *snapshotFeedback
-	serverCtx        *server.Context
-	nhConfig         config.NodeHostConfig
-	stopper          *syncutil.Stopper
-	duStopper        *syncutil.Stopper
-	nodes            *transport.Nodes
-	deploymentID     uint64
-	rsPool           []*sync.Pool
-	execEngine       *execEngine
-	logdb            raftio.ILogDB
-	transport        transport.ITransport
-	msgHandler       *messageHandler
-	liQueue          *leaderInfoQueue
-	userListener     raftio.IRaftEventListener
-	transportLatency *sample
+	snapshotStatus *snapshotFeedback
+	serverCtx      *server.Context
+	nhConfig       config.NodeHostConfig
+	stopper        *syncutil.Stopper
+	duStopper      *syncutil.Stopper
+	nodes          *transport.Nodes
+	rsPools        []*sync.Pool
+	execEngine     *execEngine
+	logdb          raftio.ILogDB
+	transport      transport.ITransport
+	msgHandler     *messageHandler
+	liQueue        *leaderInfoQueue
+	raftListener   raftio.IRaftEventListener
+	sysListener    *sysEventListener
+	fs             vfs.IFS
 }
 
 var dn = logutil.DescribeNode
@@ -268,53 +280,63 @@ func NewNodeHost(nhConfig config.NodeHostConfig) (*NodeHost, error) {
 	if err := nhConfig.Validate(); err != nil {
 		return nil, err
 	}
-	serverCtx, err := server.NewContext(nhConfig)
+	if err := nhConfig.Prepare(); err != nil {
+		return nil, err
+	}
+	serverCtx, err := server.NewContext(nhConfig, nhConfig.FS)
 	if err != nil {
 		return nil, err
 	}
 	nh := &NodeHost{
-		serverCtx:        serverCtx,
-		nhConfig:         nhConfig,
-		stopper:          syncutil.NewStopper(),
-		duStopper:        syncutil.NewStopper(),
-		nodes:            transport.NewNodes(streamConnections),
-		transportLatency: newSample(),
-		userListener:     nhConfig.RaftEventListener,
+		serverCtx:    serverCtx,
+		nhConfig:     nhConfig,
+		stopper:      syncutil.NewStopper(),
+		duStopper:    syncutil.NewStopper(),
+		nodes:        transport.NewNodes(streamConnections),
+		raftListener: nhConfig.RaftEventListener,
+		fs:           nhConfig.FS,
 	}
+	nh.sysListener = newSysEventListener(nhConfig.SystemEventListener,
+		nh.stopper.ShouldStop())
 	nh.snapshotStatus = newSnapshotFeedback(nh.pushSnapshotStatus)
 	nh.msgHandler = newNodeHostMessageHandler(nh)
 	nh.clusterMu.requests = make(map[uint64]*server.MessageQueue)
 	nh.createPools()
+	defer func() {
+		if r := recover(); r != nil {
+			nh.Stop()
+			plog.Panicf("failed to create NodeHost: %v", r)
+		}
+	}()
 	if err := nh.createTransport(); err != nil {
 		nh.Stop()
 		return nil, err
 	}
-	did := unmanagedDeploymentID
-	if nhConfig.DeploymentID == 0 {
-		plog.Warningf("DeploymentID not set in NodeHostConfig, default to %d",
-			transport.UnmanagedDeploymentID)
-		nh.transport.SetUnmanagedDeploymentID()
-	} else {
-		did = nhConfig.DeploymentID
-		nh.transport.SetDeploymentID(did)
-	}
+	did := nh.nhConfig.GetDeploymentID()
 	plog.Infof("DeploymentID set to %d", did)
-	nh.deploymentID = did
 	if err := nh.createLogDB(nhConfig, did); err != nil {
 		nh.Stop()
 		return nil, err
 	}
-	nh.execEngine = newExecEngine(nh, nh.serverCtx, nh.logdb)
+	errorInjection := false
+	if nhConfig.FS != nil {
+		_, errorInjection = nhConfig.FS.(*vfs.ErrorFS)
+		plog.Infof("filesystem error injection mode enabled: %t", errorInjection)
+	}
+	nh.execEngine = newExecEngine(nh,
+		nh.nhConfig.NotifyCommit, errorInjection, nh.serverCtx, nh.logdb)
 	nh.stopper.RunWorker(func() {
 		nh.nodeMonitorMain(nhConfig)
 	})
 	nh.stopper.RunWorker(func() {
 		nh.tickWorkerMain()
 	})
-	if nhConfig.RaftEventListener != nil {
-		nh.liQueue = newLeaderInfoQueue()
+	if nhConfig.RaftEventListener != nil || nhConfig.SystemEventListener != nil {
+		if nhConfig.RaftEventListener != nil {
+			nh.liQueue = newLeaderInfoQueue()
+		}
 		nh.stopper.RunWorker(func() {
-			nh.handleLeaderUpdatedEvents()
+			nh.handleListenerEvents()
 		})
 	}
 	nh.logNodeHostDetails()
@@ -338,12 +360,12 @@ func (nh *NodeHost) RaftAddress() string {
 // Stop stops all Raft nodes managed by the NodeHost instance, closes the
 // transport and persistent storage modules.
 func (nh *NodeHost) Stop() {
+	nh.sysListener.Publish(server.SystemEvent{
+		Type: server.NodeHostShuttingDown,
+	})
 	nh.clusterMu.Lock()
 	nh.clusterMu.stopped = true
 	nh.clusterMu.Unlock()
-	if nh.transport != nil {
-		nh.transport.RemoveMessageHandler()
-	}
 	allNodes := make([]raftio.NodeInfo, 0)
 	nh.forEachCluster(func(cid uint64, node *node) bool {
 		nodeInfo := raftio.NodeInfo{
@@ -383,50 +405,55 @@ func (nh *NodeHost) Stop() {
 	plog.Debugf("logdb closed, %s is now stopped", nh.id())
 	nh.serverCtx.Stop()
 	plog.Debugf("serverCtx stopped on %s", nh.id())
-	if delaySampleRatio > 0 {
-		nh.logTransportLatency()
-	}
 }
 
 // StartCluster adds the specified Raft cluster node to the NodeHost and starts
-// the node to make it ready for accepting incoming requests.
+// the node to make it ready for accepting incoming requests. The node to be
+// started is backed by a regular state machine that implements the
+// sm.IStateMachine interface.
 //
-// The input parameter nodes is a map of node ID to RaftAddress for indicating
-// what are initial nodes when the Raft cluster is first created. The join flag
-// indicates whether the node is a new node joining an existing cluster.
-// createStateMachine is a factory function for creating the IStateMachine
-// instance, config is the configuration instance that will be passed to the
-// underlying Raft node object, the cluster ID and node ID of the involved node
-// is given in the ClusterID and NodeID fields of the config object.
+// The input parameter initialMembers is a map of node ID to RaftAddress for all
+// Raft cluster's initial member nodes. For the same Raft cluster, the same
+// initialMembers map should be specified when starting its initial member nodes
+// on distributed NodeHost instances.
+//
+// The join flag indicates whether the node
+// is a new node joining an existing cluster. createStateMachine is a factory
+// function for creating the IStateMachine instance, config is the configuration
+// instance that will be passed to the underlying Raft node object, the cluster
+// ID and node ID of the involved node is given in the ClusterID and NodeID
+// fields of the specified config parameter.
 //
 // Note that this method is not for changing the membership of the specified
 // Raft cluster, it launches a node that is already a member of the Raft
 // cluster.
 //
 // As a summary, when -
-//  - starting a brand new Raft cluster with initial member nodes, set join to
-//    false and specify all initial member node details in the nodes map.
-//  - restarting an crashed or stopped node, set join to false. the content of
-//    the nodes map is ignored.
+//  - starting a brand new Raft cluster, set join to false and specify all initial
+//    member node details in the initialMembers map.
 //  - joining a new node to an existing Raft cluster, set join to true and leave
-//    the nodes map empty. This requires the joining node to have already been
-//    added as a member of the Raft cluster.
-func (nh *NodeHost) StartCluster(nodes map[uint64]string,
-	join bool, createStateMachine func(uint64, uint64) sm.IStateMachine,
+//    the initialMembers map empty. This requires the joining node to have already
+//    been added as a member node of the Raft cluster.
+//  - restarting an crashed or stopped node, set join to false and leave the
+//    initialMembers map to be empty. This applies to both initial member nodes
+//    and those joined later.
+func (nh *NodeHost) StartCluster(initialMembers map[uint64]string,
+	join bool,
+	createStateMachine func(uint64, uint64) sm.IStateMachine,
 	config config.Config) error {
 	stopc := make(chan struct{})
 	cf := func(clusterID uint64, nodeID uint64,
 		done <-chan struct{}) rsm.IManagedStateMachine {
 		sm := createStateMachine(clusterID, nodeID)
-		return rsm.NewNativeSM(clusterID,
-			nodeID, rsm.NewRegularStateMachine(sm), done)
+		return rsm.NewNativeSM(config, rsm.NewRegularStateMachine(sm), done)
 	}
-	return nh.startCluster(nodes, join, cf, stopc, config, pb.RegularStateMachine)
+	return nh.startCluster(initialMembers,
+		join, cf, stopc, config, pb.RegularStateMachine)
 }
 
 // StartConcurrentCluster is similar to the StartCluster method but it is used
-// to add and start a Raft node backed by a concurrent state machine.
-func (nh *NodeHost) StartConcurrentCluster(nodes map[uint64]string,
+// to start a Raft node backed by a concurrent state machine.
+func (nh *NodeHost) StartConcurrentCluster(initialMembers map[uint64]string,
 	join bool,
 	createStateMachine func(uint64, uint64) sm.IConcurrentStateMachine,
 	config config.Config) error {
@@ -434,15 +461,15 @@ func (nh *NodeHost) StartConcurrentCluster(nodes map[uint64]string,
 	cf := func(clusterID uint64, nodeID uint64,
 		done <-chan struct{}) rsm.IManagedStateMachine {
 		sm := createStateMachine(clusterID, nodeID)
-		return rsm.NewNativeSM(clusterID,
-			nodeID, rsm.NewConcurrentStateMachine(sm), done)
+		return rsm.NewNativeSM(config, rsm.NewConcurrentStateMachine(sm), done)
 	}
-	return nh.startCluster(nodes, join, cf, stopc, config, pb.ConcurrentStateMachine)
+	return nh.startCluster(initialMembers,
+		join, cf, stopc, config, pb.ConcurrentStateMachine)
 }
 
 // StartOnDiskCluster is similar to the StartCluster method but it is used to
-// add and start a Raft node backed by an IOnDiskStateMachine.
-func (nh *NodeHost) StartOnDiskCluster(nodes map[uint64]string,
+// start a Raft node backed by an IOnDiskStateMachine.
+func (nh *NodeHost) StartOnDiskCluster(initialMembers map[uint64]string,
 	join bool,
 	createStateMachine func(uint64, uint64) sm.IOnDiskStateMachine,
 	config config.Config) error {
@@ -450,10 +477,10 @@ func (nh *NodeHost) StartOnDiskCluster(nodes map[uint64]string,
 	cf := func(clusterID uint64, nodeID uint64,
 		done <-chan struct{}) rsm.IManagedStateMachine {
 		sm := createStateMachine(clusterID, nodeID)
-		return rsm.NewNativeSM(clusterID,
-			nodeID, rsm.NewOnDiskStateMachine(sm), done)
+		return rsm.NewNativeSM(config, rsm.NewOnDiskStateMachine(sm), done)
 	}
-	return nh.startCluster(nodes, join, cf, stopc, config, pb.OnDiskStateMachine)
+	return nh.startCluster(initialMembers,
+		join, cf, stopc, config, pb.OnDiskStateMachine)
 }
 
 // StopCluster removes and stops the Raft node associated with the specified
@@ -544,8 +571,11 @@ type Membership struct {
 	// Raft nodes.
 	Nodes map[uint64]string
 	// Observers is a map of NodeID values to NodeHost Raft addresses for all
-	// observers.
+	// observers in the Raft cluster.
 	Observers map[uint64]string
+	// Witnesses is a map of NodeID values to NodeHost Raft addrsses for all
+	// witnesses in the Raft cluster.
+	Witnesses map[uint64]string
 	// Removed is a set of NodeID values that have been removed from the Raft
 	// cluster. They are not allowed to be added back to the cluster.
 	Removed map[uint64]struct{}
@@ -561,14 +591,21 @@ func (nh *NodeHost) SyncGetClusterMembership(ctx context.Context,
 	clusterID uint64) (*Membership, error) {
 	v, err := nh.linearizableRead(ctx, clusterID,
 		func(node *node) (interface{}, error) {
-			members, observers, removed, confChangeID := node.sm.GetMembership()
-			membership := &Membership{
-				Nodes:          members,
-				Observers:      observers,
-				Removed:        removed,
-				ConfigChangeID: confChangeID,
+			m := node.sm.GetMembership()
+			cm := func(input map[uint64]bool) map[uint64]struct{} {
+				result := make(map[uint64]struct{})
+				for k := range input {
+					result[k] = struct{}{}
+				}
+				return result
 			}
-			return membership, nil
+			return &Membership{
+				Nodes:          m.Addresses,
+				Observers:      m.Observers,
+				Witnesses:      m.Witnesses,
+				Removed:        cm(m.Removed),
+				ConfigChangeID: m.ConfigChangeId,
+			}, nil
 		})
 	if err != nil {
 		return nil, err
@@ -725,12 +762,12 @@ func (nh *NodeHost) SyncCloseSession(ctx context.Context,
 // immediate after the return of this method.
 //
 // This method returns a RequestState instance or an error immediately.
-// Application can wait on the CompletedC member channel of the returned
-// RequestState instance to get notified for the outcome of the proposal and
-// access to the result of the proposal.
+// Application can wait on the ResultC() channel of the returned RequestState
+// instance to get notified for the outcome of the proposal and access to the
+// result of the proposal.
 //
 // After the proposal is completed, i.e. RequestResult is received from the
-// CompletedC channel of the returned RequestState, unless NO-OP client session
+// ResultC() channel of the returned RequestState, unless NO-OP client session
 // is used, it is caller's responsibility to update the Session instance
 // accordingly based on the RequestResult.Code value. Basically, when
 // RequestTimeout is returned, you can retry the same proposal without updating
@@ -742,15 +779,15 @@ func (nh *NodeHost) SyncCloseSession(ctx context.Context,
 // session ready to be used in future proposals.
 func (nh *NodeHost) Propose(session *client.Session, cmd []byte,
 	timeout time.Duration) (*RequestState, error) {
-	return nh.propose(session, cmd, nil, timeout)
+	return nh.propose(session, cmd, timeout)
 }
 
 // ProposeSession starts an asynchronous proposal on the specified cluster
 // for client session related operations. Depending on the state of the specified
 // client session object, the supported operations are for registering or
-// unregistering a client session. Application can select on the CompletedC
-// member channel of the returned RequestState instance to get notified for the
-// outcome of the operation.
+// unregistering a client session. Application can select on the ResultC()
+// channel of the returned RequestState instance to get notified for the
+// completion (RequestResult.Completed() is true) of the operation.
 func (nh *NodeHost) ProposeSession(session *client.Session,
 	timeout time.Duration) (*RequestState, error) {
 	v, ok := nh.getCluster(session.ClusterID)
@@ -760,14 +797,14 @@ func (nh *NodeHost) ProposeSession(session *client.Session,
 	if !v.supportClientSession() && !session.IsNoOPSession() {
 		plog.Panicf("IOnDiskStateMachine based nodes must use NoOPSession")
 	}
-	req, err := v.proposeSession(session, nil, timeout)
-	nh.execEngine.setNodeReady(session.ClusterID)
+	req, err := v.proposeSession(session, nh.getTimeoutTick(timeout))
+	nh.execEngine.setStepReady(session.ClusterID)
 	return req, err
 }
 
 // ReadIndex starts the asynchronous ReadIndex protocol used for linearizable
 // read on the specified cluster. This method returns a RequestState instance
-// or an error immediately. Application should wait on the CompletedC channel
+// or an error immediately. Application should wait on the ResultC() channel
 // of the returned RequestState object to get notified on the outcome of the
 // ReadIndex operation. On a successful completion, the ReadLocal method can
 // then be invoked to query the state of the IStateMachine or
@@ -775,7 +812,7 @@ func (nh *NodeHost) ProposeSession(session *client.Session,
 // guarantee.
 func (nh *NodeHost) ReadIndex(clusterID uint64,
 	timeout time.Duration) (*RequestState, error) {
-	rs, _, err := nh.readIndex(clusterID, nil, timeout)
+	rs, _, err := nh.readIndex(clusterID, timeout)
 	return rs, err
 }
 
@@ -835,6 +872,9 @@ func (nh *NodeHost) StaleRead(clusterID uint64,
 	if !v.initialized() {
 		return nil, ErrClusterNotInitialized
 	}
+	if v.isWitness() {
+		return nil, ErrInvalidOperation
+	}
 	data, err := v.sm.Lookup(query)
 	if err == rsm.ErrClusterClosed {
 		return nil, ErrClusterClosed
@@ -860,7 +900,7 @@ func (nh *NodeHost) SyncRequestSnapshot(ctx context.Context,
 		return 0, err
 	}
 	select {
-	case r := <-rs.CompletedC:
+	case r := <-rs.AppliedC():
 		if r.Completed() {
 			return r.GetResult().Value, nil
 		} else if r.Rejected() {
@@ -882,15 +922,15 @@ func (nh *NodeHost) SyncRequestSnapshot(ctx context.Context,
 }
 
 // RequestSnapshot requests a snapshot to be created asynchronously for the
-// specified cluster node. For each node, only one pending requested snapshot
-// operation is allowed.
+// specified cluster node. For each node, only one ongoing snapshot operation
+// is allowed.
 //
 // Users can use an option parameter to specify details of the requested
 // snapshot. For example, when the input SnapshotOption's Exported field is
 // True, a snapshot will be exported to the directory pointed by the ExportPath
 // field of the SnapshotOption instance. Such an exported snapshot is not
 // managed by the system and it is mainly used to repair the cluster when it
-// permanently lose its majority quorum. See the ImportSnapshot method in the
+// permanently loses its majority quorum. See the ImportSnapshot method in the
 // tools package for more details.
 //
 // When the Exported field of the input SnapshotOption instance is set to false,
@@ -903,12 +943,12 @@ func (nh *NodeHost) SyncRequestSnapshot(ctx context.Context,
 // nodes are typically used to trigger Raft log and snapshot compactions.
 //
 // RequestSnapshot returns a RequestState instance or an error immediately.
-// Applications can wait on the CompletedC member channel of the returned
-// RequestState instance to get notified for the outcome of the create snasphot
-// operation. The RequestResult instance returned by the CompletedC channel
-// tells the outcome of the snapshot operation, when successful, the
-// SnapshotIndex method of the returned RequestResult instance reports the index
-// of the created snapshot.
+// Applications can wait on the ResultC() channel of the returned RequestState
+// instance to get notified for the outcome of the create snasphot operation.
+// The RequestResult instance returned by the ResultC() channel tells the
+// outcome of the snapshot operation, when successful, the SnapshotIndex method
+// of the returned RequestResult instance reports the index of the created
+// snapshot.
 //
 // Requested snapshot operation will be rejected if there is already an existing
 // snapshot in the system at the same Raft log index.
@@ -918,9 +958,42 @@ func (nh *NodeHost) RequestSnapshot(clusterID uint64,
 	if !ok {
 		return nil, ErrClusterNotFound
 	}
-	req, err := v.requestSnapshot(opt, timeout)
-	nh.execEngine.setNodeReady(clusterID)
+	req, err := v.requestSnapshot(opt, nh.getTimeoutTick(timeout))
+	nh.execEngine.setStepReady(clusterID)
 	return req, err
+}
+
+// RequestCompaction requests a compaction operation to be asynchronously
+// executed in the background to reclaim disk spaces used by Raft Log entries
+// that have already been marked as removed. This includes Raft Log entries
+// that have already been included in created snapshots and Raft Log entries
+// that belong to nodes already permanently removed via NodeHost.RemoveData().
+//
+// By default, compaction is automatically issued after each snapshot is
+// captured. RequestCompaction can be used to manually trigger such compaction
+// when auto compaction is disabled by the DisableAutoCompactions option in
+// config.Config.
+//
+// The returned *SysOpState instance can be used to get notified when the
+// requested compaction is completed. ErrRejected is returned when there is
+// nothing to be reclaimed.
+func (nh *NodeHost) RequestCompaction(clusterID uint64,
+	nodeID uint64) (*SysOpState, error) {
+	v, ok := nh.getCluster(clusterID)
+	if !ok {
+		// assume this is a node that has already been removed via RemoveData
+		done, err := nh.logdb.CompactEntriesTo(clusterID, nodeID, math.MaxUint64)
+		if err != nil {
+			return nil, err
+		}
+		return &SysOpState{completedC: done}, nil
+	}
+	if v.nodeID != nodeID {
+		return nil, ErrClusterNotFound
+	}
+	op, err := v.requestCompaction()
+	nh.execEngine.setStepReady(clusterID)
+	return op, err
 }
 
 // SyncRequestDeleteNode is the synchronous variant of the RequestDeleteNode
@@ -981,10 +1054,30 @@ func (nh *NodeHost) SyncRequestAddObserver(ctx context.Context,
 	return err
 }
 
+// SyncRequestAddWitness is the synchronous variant of the RequestAddWitness
+// method. See RequestAddWitness for more details.
+//
+// The input ctx must have its deadline set.
+func (nh *NodeHost) SyncRequestAddWitness(ctx context.Context,
+	clusterID uint64, nodeID uint64,
+	address string, configChangeIndex uint64) error {
+	timeout, err := getTimeoutFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	rs, err := nh.RequestAddWitness(clusterID,
+		nodeID, address, configChangeIndex, timeout)
+	if err != nil {
+		return err
+	}
+	_, err = checkRequestState(ctx, rs)
+	return err
+}
+
 // RequestDeleteNode is a Raft cluster membership change method for requesting
 // the specified node to be removed from the specified Raft cluster. It starts
 // an asynchronous request to remove the node from the Raft cluster membership
-// list. Application can wait on the CompletedC member of the returned
+// list. Application can wait on the ResultC() channel of the returned
 // RequestState instance to get notified for the outcome.
 //
 // It is not guaranteed that deleted node will automatically close itself and
@@ -999,8 +1092,8 @@ func (nh *NodeHost) SyncRequestAddObserver(ctx context.Context,
 // set as false, the configChangeIndex parameter is ignored. Otherwise, it
 // should be set to the most recent Config Change Index value returned by the
 // SyncGetClusterMembership method. The requested delete node operation will be
-// rejected if other membership change has been applied since the call to
-// the SyncGetClusterMembership method.
+// rejected if other membership change has been applied since that earlier call
+// to the SyncGetClusterMembership method.
 func (nh *NodeHost) RequestDeleteNode(clusterID uint64,
 	nodeID uint64,
 	configChangeIndex uint64, timeout time.Duration) (*RequestState, error) {
@@ -1008,15 +1101,16 @@ func (nh *NodeHost) RequestDeleteNode(clusterID uint64,
 	if !ok {
 		return nil, ErrClusterNotFound
 	}
-	req, err := v.requestDeleteNodeWithOrderID(nodeID, configChangeIndex, timeout)
-	nh.execEngine.setNodeReady(clusterID)
+	tt := nh.getTimeoutTick(timeout)
+	req, err := v.requestDeleteNodeWithOrderID(nodeID, configChangeIndex, tt)
+	nh.execEngine.setStepReady(clusterID)
 	return req, err
 }
 
 // RequestAddNode is a Raft cluster membership change method for requesting the
 // specified node to be added to the specified Raft cluster. It starts an
 // asynchronous request to add the node to the Raft cluster membership list.
-// Application can wait on the CompletedC member of the returned RequestState
+// Application can wait on the ResultC() channel of the returned RequestState
 // instance to get notified for the outcome.
 //
 // If there is already an observer with the same nodeID in the cluster, it will
@@ -1035,7 +1129,7 @@ func (nh *NodeHost) RequestDeleteNode(clusterID uint64,
 // parameter is ignored. Otherwise, it should be set to the most recent Config
 // Change Index value returned by the SyncGetClusterMembership method. The
 // requested add node operation will be rejected if other membership change has
-// been applied since the call to the SyncGetClusterMembership method.
+// been applied since that earlier call to the SyncGetClusterMembership method.
 func (nh *NodeHost) RequestAddNode(clusterID uint64,
 	nodeID uint64, address string, configChangeIndex uint64,
 	timeout time.Duration) (*RequestState, error) {
@@ -1044,8 +1138,8 @@ func (nh *NodeHost) RequestAddNode(clusterID uint64,
 		return nil, ErrClusterNotFound
 	}
 	req, err := v.requestAddNodeWithOrderID(nodeID,
-		address, configChangeIndex, timeout)
-	nh.execEngine.setNodeReady(clusterID)
+		address, configChangeIndex, nh.getTimeoutTick(timeout))
+	nh.execEngine.setStepReady(clusterID)
 	return req, err
 }
 
@@ -1055,10 +1149,10 @@ func (nh *NodeHost) RequestAddNode(clusterID uint64,
 // node as an observer.
 //
 // Such observer is able to receive replicated states from the leader node, but
-// it is not allowed to vote for leader, it is not considered as a part of
-// the quorum when replicating state. An observer can be promoted to a regular
-// node with voting power by making a RequestAddNode call using its clusterID
-// and nodeID values. An observer can be removed from the cluster by calling
+// it is neither allowed to vote for leader, nor considered as a part of the
+// quorum when replicating state. An observer can be promoted to a regular node
+// with voting power by making a RequestAddNode call using its clusterID and
+// nodeID values. An observer can be removed from the cluster by calling
 // RequestDeleteNode with its clusterID and nodeID values.
 //
 // Application should later call StartCluster with config.Config.IsObserver
@@ -1070,7 +1164,8 @@ func (nh *NodeHost) RequestAddNode(clusterID uint64,
 // parameter is ignored. Otherwise, it should be set to the most recent Config
 // Change Index value returned by the SyncGetClusterMembership method. The
 // requested add observer operation will be rejected if other membership change
-// has been applied since the call to the SyncGetClusterMembership method.
+// has been applied since that earlier call to the SyncGetClusterMembership
+// method.
 func (nh *NodeHost) RequestAddObserver(clusterID uint64,
 	nodeID uint64, address string, configChangeIndex uint64,
 	timeout time.Duration) (*RequestState, error) {
@@ -1079,8 +1174,42 @@ func (nh *NodeHost) RequestAddObserver(clusterID uint64,
 		return nil, ErrClusterNotFound
 	}
 	req, err := v.requestAddObserverWithOrderID(nodeID,
-		address, configChangeIndex, timeout)
-	nh.execEngine.setNodeReady(clusterID)
+		address, configChangeIndex, nh.getTimeoutTick(timeout))
+	nh.execEngine.setStepReady(clusterID)
+	return req, err
+}
+
+// RequestAddWitness is a Raft cluster membership change method for requesting
+// the specified node to be added as a witness to the given Raft cluster. It
+// starts an asynchronous request to add the specified node as an witness.
+//
+// A witness can vote in elections but it doesn't have any Raft log or
+// application state machine associated. The witness node can not be used
+// to initiate read, write or membership change operations on its Raft cluster.
+// Section 11.7.2 of Diego Ongaro's thesis contains more info on such witness
+// role.
+//
+// Application should later call StartCluster with config.Config.IsWitness
+// set to true on the right NodeHost to actually start the witness node.
+//
+// The input address parameter is the RaftAddress of the NodeHost where the new
+// witness being added will be running. When the raft cluster is created with
+// the OrderedConfigChange config flag set as false, the configChangeIndex
+// parameter is ignored. Otherwise, it should be set to the most recent Config
+// Change Index value returned by the SyncGetClusterMembership method. The
+// requested add witness operation will be rejected if other membership change
+// has been applied since that earlier call to the SyncGetClusterMembership
+// method.
+func (nh *NodeHost) RequestAddWitness(clusterID uint64,
+	nodeID uint64, address string, configChangeIndex uint64,
+	timeout time.Duration) (*RequestState, error) {
+	v, ok := nh.getCluster(clusterID)
+	if !ok {
+		return nil, ErrClusterNotFound
+	}
+	req, err := v.requestAddWitnessWithOrderID(nodeID,
+		address, configChangeIndex, nh.getTimeoutTick(timeout))
+	nh.execEngine.setStepReady(clusterID)
 	return req, err
 }
 
@@ -1099,7 +1228,7 @@ func (nh *NodeHost) RequestLeaderTransfer(clusterID uint64,
 		clusterID, targetNodeID)
 	err := v.requestLeaderTransfer(targetNodeID)
 	if err == nil {
-		nh.execEngine.setNodeReady(clusterID)
+		nh.execEngine.setStepReady(clusterID)
 	}
 	return err
 }
@@ -1116,20 +1245,10 @@ func (nh *NodeHost) SyncRemoveData(ctx context.Context,
 	if ok && n.nodeID == nodeID {
 		return ErrClusterNotStopped
 	}
-	ticker := time.NewTicker(20 * time.Millisecond)
-	defer ticker.Stop()
-	for {
+	destroyedC := nh.execEngine.destroyedC(clusterID, nodeID)
+	if destroyedC != nil {
 		select {
-		case <-ticker.C:
-			// TODO (lni):
-			// polling below is not cool
-			if err := nh.RemoveData(clusterID, nodeID); err != nil {
-				if err == ErrClusterNotStopped {
-					continue
-				}
-				panic(err)
-			}
-			return nil
+		case <-destroyedC:
 		case <-ctx.Done():
 			if ctx.Err() == context.Canceled {
 				return ErrCanceled
@@ -1138,6 +1257,11 @@ func (nh *NodeHost) SyncRemoveData(ctx context.Context,
 			}
 		}
 	}
+	err := nh.RemoveData(clusterID, nodeID)
+	if err == ErrClusterNotStopped {
+		panic("node not stopped")
+	}
+	return err
 }
 
 // RemoveData tries to remove all data associated with the specified node. This
@@ -1166,7 +1290,7 @@ func (nh *NodeHost) removeData(clusterID uint64, nodeID uint64) error {
 		panic(err)
 	}
 	// mark the snapshot dir as removed
-	did := nh.deploymentID
+	did := nh.nhConfig.GetDeploymentID()
 	if err := nh.serverCtx.RemoveSnapshotDir(did, clusterID, nodeID); err != nil {
 		panic(err)
 	}
@@ -1185,7 +1309,7 @@ func (nh *NodeHost) GetNodeUser(clusterID uint64) (INodeUser, error) {
 	nu := &nodeUser{
 		nh:           nh,
 		node:         v,
-		setNodeReady: nh.execEngine.setNodeReady,
+		setStepReady: nh.execEngine.setStepReady,
 	}
 	return nu, nil
 }
@@ -1222,13 +1346,7 @@ func (nh *NodeHost) GetNodeHostInfo(opt NodeHostInfoOption) *NodeHostInfo {
 }
 
 func (nh *NodeHost) propose(s *client.Session,
-	cmd []byte, handler ICompleteHandler,
-	timeout time.Duration) (*RequestState, error) {
-	var st time.Time
-	sampled := delaySampled(s)
-	if sampled {
-		st = time.Now()
-	}
+	cmd []byte, timeout time.Duration) (*RequestState, error) {
 	v, ok := nh.getClusterNotLocked(s.ClusterID)
 	if !ok {
 		return nil, ErrClusterNotFound
@@ -1236,26 +1354,22 @@ func (nh *NodeHost) propose(s *client.Session,
 	if !v.supportClientSession() && !s.IsNoOPSession() {
 		plog.Panicf("IOnDiskStateMachine based nodes must use NoOPSession")
 	}
-	req, err := v.propose(s, cmd, handler, timeout)
-	nh.execEngine.setNodeReady(s.ClusterID)
-	if sampled {
-		nh.execEngine.proposeDelay(s.ClusterID, st)
-	}
+	req, err := v.propose(s, cmd, nh.getTimeoutTick(timeout))
+	nh.execEngine.setStepReady(s.ClusterID)
 	return req, err
 }
 
 func (nh *NodeHost) readIndex(clusterID uint64,
-	handler ICompleteHandler,
 	timeout time.Duration) (*RequestState, *node, error) {
 	n, ok := nh.getClusterNotLocked(clusterID)
 	if !ok {
 		return nil, nil, ErrClusterNotFound
 	}
-	req, err := n.read(handler, timeout)
+	req, err := n.read(nh.getTimeoutTick(timeout))
 	if err != nil {
 		return nil, nil, err
 	}
-	nh.execEngine.setNodeReady(clusterID)
+	nh.execEngine.setStepReady(clusterID)
 	return req, n, err
 }
 
@@ -1266,12 +1380,12 @@ func (nh *NodeHost) linearizableRead(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
-	rs, node, err := nh.readIndex(clusterID, nil, timeout)
+	rs, node, err := nh.readIndex(clusterID, timeout)
 	if err != nil {
 		return nil, err
 	}
 	select {
-	case s := <-rs.CompletedC:
+	case s := <-rs.AppliedC():
 		if s.Timeout() {
 			return nil, ErrTimeout
 		} else if s.Completed() {
@@ -1349,47 +1463,50 @@ func (nh *NodeHost) forEachCluster(f func(uint64, *node) bool) {
 	nh.forEachClusterRun(nil, nil, f)
 }
 
-// there are two major reasons to bootstrap the cluster
-// 1. check whether user is incorrectly specifying the startCluster parameters,
-//    e.g. call startCluster with join=true first, restart the NodeHost then
-//    call startCluster again with join=false and len(nodes) > 0
+// there are three major reasons to bootstrap the cluster
+//
+// 1. when possible, we check whether user incorrectly specified parameters
+//    for the startCluster method, e.g. call startCluster with join=true first,
+//    then restart the NodeHost instance and call startCluster again with
+//    join=false and len(nodes) > 0
 // 2. when restarting a node which is a part of the initial cluster members,
-//    we should allow the caller not to provide a non-empty nodes with all
-//    initial member info in it, but when it is necessary to bootstrap at
-//    the raft node level again, we need to get the initial member info from
-//    somewhere. bootstrap is the process that records such info
-// 3. bootstrap record is used as the node info record in our default Log DB
-//    implementation
-func (nh *NodeHost) bootstrapCluster(nodes map[uint64]string,
-	join bool, config config.Config,
+//    for user convenience, we allow the caller not to provide the details of
+//    all initial members. when the initial cluster member info is required,
+//    we need to get the initial member info from somewhere. bootstrap is the
+//    procedure that records such info.
+// 3. the bootstrap record is used as a marker record in our default Log DB
+//    implementation to indicate that a certain node exists there
+func (nh *NodeHost) bootstrapCluster(initialMembers map[uint64]string,
+	join bool, cfg config.Config,
 	smType pb.StateMachineType) (map[uint64]string, bool, error) {
-	binfo, err := nh.logdb.GetBootstrapInfo(config.ClusterID, config.NodeID)
+	bi, err := nh.logdb.GetBootstrapInfo(cfg.ClusterID, cfg.NodeID)
 	if err == raftio.ErrNoBootstrapInfo {
+		if !join && len(initialMembers) == 0 {
+			return nil, false, ErrClusterNotBootstrapped
+		}
 		var members map[uint64]string
 		if !join {
-			members = nodes
+			members = initialMembers
 		}
-		bs := pb.NewBootstrapInfo(join, smType, nodes)
-		err := nh.logdb.SaveBootstrapInfo(config.ClusterID, config.NodeID, *bs)
+		bi = pb.NewBootstrapInfo(join, smType, initialMembers)
+		err := nh.logdb.SaveBootstrapInfo(cfg.ClusterID, cfg.NodeID, *bi)
 		if err != nil {
 			return nil, false, err
 		}
-		plog.Infof("%s bootstrapped, members: %v",
-			dn(config.ClusterID, config.NodeID), members)
 		return members, !join, nil
 	} else if err != nil {
 		return nil, false, err
 	}
-	if !binfo.Validate(nodes, join, smType) {
-		plog.Errorf("bootstrap validation failed, %s, %v, %t, %v, %t",
-			dn(config.ClusterID, config.NodeID),
-			binfo.Addresses, binfo.Join, nodes, join)
+	if !bi.Validate(initialMembers, join, smType) {
+		plog.Errorf("bootstrap info validation failed, %s, %v, %t, %v, %t",
+			dn(cfg.ClusterID, cfg.NodeID),
+			bi.Addresses, bi.Join, initialMembers, join)
 		return nil, false, ErrInvalidClusterSettings
 	}
-	return binfo.Addresses, !binfo.Join, nil
+	return bi.Addresses, !bi.Join, nil
 }
 
-func (nh *NodeHost) startCluster(nodes map[uint64]string,
+func (nh *NodeHost) startCluster(initialMembers map[uint64]string,
 	join bool,
 	createStateMachine rsm.ManagedStateMachineFactory,
 	stopc chan struct{},
@@ -1397,8 +1514,6 @@ func (nh *NodeHost) startCluster(nodes map[uint64]string,
 	smType pb.StateMachineType) error {
 	clusterID := config.ClusterID
 	nodeID := config.NodeID
-	plog.Infof("%s called startCluster, join %t, nodes %v",
-		dn(clusterID, nodeID), join, nodes)
 	nh.clusterMu.Lock()
 	defer nh.clusterMu.Unlock()
 	if nh.clusterMu.stopped {
@@ -1407,28 +1522,27 @@ func (nh *NodeHost) startCluster(nodes map[uint64]string,
 	if _, ok := nh.clusterMu.clusters.Load(clusterID); ok {
 		return ErrClusterAlreadyExist
 	}
-	if join && len(nodes) > 0 {
-		plog.Errorf("trying to join %s with initial member list %v",
-			dn(clusterID, nodeID), nodes)
+	if nh.execEngine.nodeLoaded(clusterID, nodeID) {
+		return ErrClusterAlreadyExist
+	}
+	if join && len(initialMembers) > 0 {
 		return ErrInvalidClusterSettings
 	}
-	addrs, members, err := nh.bootstrapCluster(nodes, join, config, smType)
+	peers, im, err := nh.bootstrapCluster(initialMembers, join, config, smType)
 	if err == ErrInvalidClusterSettings {
 		return ErrInvalidClusterSettings
 	}
 	if err != nil {
 		panic(err)
 	}
-	plog.Infof("%s reported bootstrap info %v", dn(clusterID, nodeID), addrs)
 	queue := server.NewMessageQueue(receiveQueueLen,
 		false, lazyFreeCycle, nh.nhConfig.MaxReceiveQueueSize)
-	for k, v := range addrs {
+	for k, v := range peers {
 		if k != nodeID {
-			plog.Infof("%s called AddNode, addr %s", dn(clusterID, k), v)
-			nh.nodes.AddNode(clusterID, k, v)
+			nh.nodes.Add(clusterID, k, v)
 		}
 	}
-	if err := nh.serverCtx.CreateSnapshotDir(nh.deploymentID,
+	if err := nh.serverCtx.CreateSnapshotDir(nh.nhConfig.GetDeploymentID(),
 		clusterID, nodeID); err != nil {
 		if err == server.ErrDirMarkedAsDeleted {
 			return ErrNodeRemoved
@@ -1436,67 +1550,63 @@ func (nh *NodeHost) startCluster(nodes map[uint64]string,
 		panic(err)
 	}
 	getSnapshotDirFunc := func(cid uint64, nid uint64) string {
-		return nh.serverCtx.GetSnapshotDir(nh.deploymentID, cid, nid)
-	}
-	getStreamConn := func(cid uint64, nid uint64) pb.IChunkSink {
-		conn := nh.transport.GetStreamConnection(cid, nid)
-		if conn == nil {
-			return nil
-		}
-		return conn
-	}
-	handleSnapshotStatus := func(cid uint64, nid uint64, failed bool) {
-		nh.msgHandler.HandleSnapshotStatus(cid, nid, failed)
+		return nh.serverCtx.GetSnapshotDir(nh.nhConfig.GetDeploymentID(), cid, nid)
 	}
 	snapshotter := newSnapshotter(clusterID, nodeID,
-		nh.nhConfig, getSnapshotDirFunc, nh.logdb, stopc)
-	if err := snapshotter.ProcessOrphans(); err != nil {
+		nh.nhConfig, getSnapshotDirFunc, nh.logdb, stopc, nh.fs)
+	if err := snapshotter.processOrphans(); err != nil {
 		panic(err)
 	}
 	rn, err := newNode(nh.nhConfig.RaftAddress,
-		addrs,
-		members,
+		peers,
+		im,
 		snapshotter,
 		createStateMachine(clusterID, nodeID, stopc),
 		smType,
 		nh.execEngine,
 		nh.liQueue,
-		getStreamConn,
-		handleSnapshotStatus,
+		nh.transport.GetStreamSink,
+		nh.msgHandler.HandleSnapshotStatus,
 		nh.sendMessage,
 		queue,
 		stopc,
 		nh.nodes,
-		nh.rsPool[nodeID%rsPoolSize],
+		nh.rsPools[nodeID%rsPoolShards],
 		config,
 		nh.nhConfig.EnableMetrics,
+		nh.nhConfig.NotifyCommit,
 		nh.nhConfig.RTTMillisecond,
-		nh.logdb)
+		nh.logdb,
+		nh.sysListener)
 	if err != nil {
 		panic(err)
 	}
 	nh.clusterMu.clusters.Store(clusterID, rn)
 	nh.clusterMu.requests[clusterID] = queue
 	nh.clusterMu.csi++
+	nh.execEngine.setApplyReady(clusterID)
 	return nil
 }
 
 func (nh *NodeHost) createPools() {
-	nh.rsPool = make([]*sync.Pool, rsPoolSize)
-	for i := uint64(0); i < rsPoolSize; i++ {
+	nh.rsPools = make([]*sync.Pool, rsPoolShards)
+	for i := uint64(0); i < rsPoolShards; i++ {
 		p := &sync.Pool{}
 		p.New = func() interface{} {
 			obj := &RequestState{}
 			obj.CompletedC = make(chan RequestResult, 1)
 			obj.pool = p
+			if nh.nhConfig.NotifyCommit {
+				obj.committedC = make(chan RequestResult, 1)
+			}
 			return obj
 		}
-		nh.rsPool[i] = p
+		nh.rsPools[i] = p
 	}
 }
 
 func (nh *NodeHost) createLogDB(cfg config.NodeHostConfig, did uint64) error {
-	nhDirs, walDirs, err := nh.serverCtx.CreateNodeHostDir(did)
+	nhDir, walDir, err := nh.serverCtx.CreateNodeHostDir(did)
 	if err != nil {
 		return err
 	}
@@ -1504,20 +1614,25 @@ func (nh *NodeHost) createLogDB(cfg config.NodeHostConfig, did uint64) error {
 		return err
 	}
 	var factory config.LogDBFactoryFunc
+	df := func(config config.LogDBConfig,
+		dirs []string, lows []string) (raftio.ILogDB, error) {
+		return logdb.NewDefaultLogDB(config, dirs, lows, nh.fs)
+	}
 	if cfg.LogDBFactory != nil {
 		factory = cfg.LogDBFactory
 	} else {
-		factory = logdb.NewDefaultLogDB
+		factory = df
 	}
 	// create a tmp logdb to get LogDB type info
-	name, err := logdb.GetLogDBInfo(factory, nhDirs)
+	name, err := logdb.GetLogDBInfo(factory, nh.nhConfig.LogDBConfig,
+		[]string{nhDir}, nh.fs)
 	if err != nil {
 		return err
 	}
 	if err := nh.serverCtx.CheckLogDBType(did, name); err != nil {
 		return err
 	}
-	ldb, err := factory(nhDirs, walDirs)
+	ldb, err := factory(nh.nhConfig.LogDBConfig, []string{nhDir}, []string{walDir})
 	if err != nil {
 		return err
 	}
@@ -1536,15 +1651,35 @@ func (nh *NodeHost) createLogDB(cfg config.NodeHostConfig, did uint64) error {
 			return server.ErrLogDBBrokenChange
 		}
 	}
+	plog.Infof("logdb memory limit: %dMBytes", cfg.LogDBConfig.MemorySizeMB())
 	return nil
+}
+
+type transportEvent struct {
+	nh *NodeHost
+}
+
+func (te *transportEvent) ConnectionEstablished(addr string, snapshot bool) {
+	te.nh.sysListener.Publish(server.SystemEvent{
+		Type:               server.ConnectionEstablished,
+		Address:            addr,
+		SnapshotConnection: snapshot,
+	})
+}
+func (te *transportEvent) ConnectionFailed(addr string, snapshot bool) {
+	te.nh.sysListener.Publish(server.SystemEvent{
+		Type:               server.ConnectionFailed,
+		Address:            addr,
+		SnapshotConnection: snapshot,
+	})
 }
 
 func (nh *NodeHost) createTransport() error {
 	getSnapshotDirFunc := func(cid uint64, nid uint64) string {
-		return nh.serverCtx.GetSnapshotDir(nh.deploymentID, cid, nid)
+		return nh.serverCtx.GetSnapshotDir(nh.nhConfig.GetDeploymentID(), cid, nid)
 	}
 	tsp, err := transport.NewTransport(nh.nhConfig,
-		nh.serverCtx, nh.nodes, getSnapshotDirFunc)
+		nh.serverCtx, nh.nodes, getSnapshotDirFunc, &transportEvent{nh: nh}, nh.fs)
 	if err != nil {
 		return err
 	}
@@ -1561,15 +1696,15 @@ func (nh *NodeHost) stopNode(clusterID uint64,
 	if !ok {
 		return ErrClusterNotFound
 	}
-	cluster := v.(*node)
-	if nodeCheck && cluster.nodeID != nodeID {
+	n := v.(*node)
+	if nodeCheck && n.nodeID != nodeID {
 		return ErrClusterNotFound
 	}
 	nh.clusterMu.clusters.Delete(clusterID)
 	delete(nh.clusterMu.requests, clusterID)
 	nh.clusterMu.csi++
-	cluster.close()
-	cluster.notifyOffloaded(rsm.FromNodeHost)
+	n.close()
+	n.offloaded(rsm.FromNodeHost)
 	return nil
 }
 
@@ -1592,32 +1727,43 @@ func (nh *NodeHost) tickWorkerMain() {
 	idx := uint64(0)
 	nodes := make([]*node, 0)
 	qs := make(map[uint64]*server.MessageQueue)
-	tf := func() bool {
-		count++
-		nh.increaseTick()
-		if count%nh.nhConfig.RTTMillisecond == 0 {
+	tf := func(usec uint64) bool {
+		tms := usec / 1000
+		count += tms
+		for i := uint64(0); i < tms; i++ {
+			nh.increaseTick()
+		}
+		if count >= nh.nhConfig.RTTMillisecond {
+			count -= nh.nhConfig.RTTMillisecond
 			idx, nodes, qs = nh.getCurrentClusters(idx, nodes, qs)
 			nh.snapshotStatus.pushReady(nh.getTick())
 			nh.sendTickMessage(nodes, qs)
 		}
 		return false
 	}
-	server.RunTicker(time.Millisecond, tf, nh.stopper.ShouldStop(), nil)
+	server.StartTicker(nh.nhConfig.SystemTickerPrecision,
+		tf, nh.stopper.ShouldStop())
 }
 
-func (nh *NodeHost) handleLeaderUpdatedEvents() {
+func (nh *NodeHost) handleListenerEvents() {
+	var lic chan struct{}
+	if nh.liQueue != nil {
+		lic = nh.liQueue.workReady()
+	}
 	for {
 		select {
 		case <-nh.stopper.ShouldStop():
 			return
-		case <-nh.liQueue.workReady():
+		case <-lic:
 			for {
 				v, ok := nh.liQueue.getLeaderInfo()
 				if !ok {
 					break
 				}
-				nh.userListener.LeaderUpdated(v)
+				nh.raftListener.LeaderUpdated(v)
 			}
+		case e := <-nh.sysListener.events:
+			nh.sysListener.handle(e)
 		}
 	}
 }
@@ -1648,19 +1794,25 @@ func (nh *NodeHost) sendMessage(msg pb.Message) {
 		return
 	}
 	if msg.Type != pb.InstallSnapshot {
-		nh.transport.ASyncSend(msg)
-		nh.checkTransportLatency(msg.ClusterId, msg.To, msg.From, msg.Term)
+		nh.transport.Send(msg)
 	} else {
-		plog.Infof("%s is sending snapshot to %s, index %d, size %d",
+		witness := msg.Snapshot.Witness
+		plog.Infof("%s is sending snapshot to %s, witness %t, index %d, size %d",
 			dn(msg.ClusterId, msg.From), dn(msg.ClusterId, msg.To),
-			msg.Snapshot.Index, msg.Snapshot.FileSize)
+			witness, msg.Snapshot.Index, msg.Snapshot.FileSize)
 		if n, ok := nh.getCluster(msg.ClusterId); ok {
-			if !n.OnDiskStateMachine() {
-				nh.transport.ASyncSendSnapshot(msg)
+			if witness || !n.OnDiskStateMachine() {
+				nh.transport.SendSnapshot(msg)
 			} else {
 				n.pushStreamSnapshotRequest(msg.ClusterId, msg.To)
 			}
 		}
+		nh.sysListener.Publish(server.SystemEvent{
+			Type:      server.SendSnapshotStarted,
+			ClusterID: msg.ClusterId,
+			NodeID:    msg.To,
+			From:      msg.From,
+		})
 	}
 }
 
@@ -1673,23 +1825,7 @@ func (nh *NodeHost) sendTickMessage(clusters []*node,
 			continue
 		}
 		q.Add(m)
-		nh.execEngine.setNodeReady(n.clusterID)
-	}
-}
-
-func (nh *NodeHost) checkTransportLatency(clusterID uint64,
-	to uint64, from uint64, term uint64) {
-	v := atomic.AddUint64(&nh.msgCount, 1)
-	if delaySampleRatio > 0 && v%delaySampleRatio == 0 {
-		msg := pb.Message{
-			Type:      pb.Ping,
-			To:        to,
-			From:      from,
-			ClusterId: clusterID,
-			Term:      term,
-			Hint:      uint64(time.Now().UnixNano()),
-		}
-		nh.transport.ASyncSend(msg)
+		nh.execEngine.setStepReady(n.clusterID)
 	}
 }
 
@@ -1718,6 +1854,7 @@ func (nh *NodeHost) closeStoppedClusters() {
 	if !ok && chosen < len(keys) {
 		clusterID := keys[chosen]
 		nodeID := nodeIDs[chosen]
+		plog.Infof("%s will be stopped by the node monitor", dn(clusterID, nodeID))
 		if err := nh.StopNode(clusterID, nodeID); err != nil {
 			plog.Errorf("failed to remove cluster %d", clusterID)
 		}
@@ -1725,13 +1862,11 @@ func (nh *NodeHost) closeStoppedClusters() {
 }
 
 func (nh *NodeHost) nodeMonitorMain(nhConfig config.NodeHostConfig) {
-	count := uint64(0)
-	tf := func() bool {
-		count++
+	tf := func(usec uint64) bool {
 		nh.closeStoppedClusters()
 		return false
 	}
-	server.RunTicker(monitorInterval, tf, nh.stopper.ShouldStop(), nil)
+	server.StartTicker(monitorInterval, tf, nh.stopper.ShouldStop())
 }
 
 func (nh *NodeHost) pushSnapshotStatus(clusterID uint64,
@@ -1745,7 +1880,7 @@ func (nh *NodeHost) pushSnapshotStatus(clusterID uint64,
 		}
 		added, stopped := q.Add(m)
 		if added {
-			nh.execEngine.setNodeReady(clusterID)
+			nh.execEngine.setStepReady(clusterID)
 			plog.Infof("%s just got snapshot status", dn(clusterID, nodeID))
 			return true
 		}
@@ -1773,6 +1908,11 @@ func (nh *NodeHost) getTick() uint64 {
 	return atomic.LoadUint64(&nh.tick)
 }
 
+func (nh *NodeHost) getTimeoutTick(timeout time.Duration) uint64 {
+	timeoutMs := uint64(timeout.Nanoseconds() / 1000000)
+	return timeoutMs / nh.nhConfig.RTTMillisecond
+}
+
 func (nh *NodeHost) getClusterSetIndex() uint64 {
 	nh.clusterMu.RLock()
 	v := nh.clusterMu.csi
@@ -1794,17 +1934,10 @@ func (nh *NodeHost) logNodeHostDetails() {
 	plog.Infof("nodehost address: %s", nh.nhConfig.RaftAddress)
 }
 
-func (nh *NodeHost) logTransportLatency() {
-	plog.Infof("transport latency p999 %dμs, p99 %dμs, median %dμs, %d",
-		nh.transportLatency.p999(),
-		nh.transportLatency.p99(),
-		nh.transportLatency.median(), len(nh.transportLatency.samples))
-}
-
 func checkRequestState(ctx context.Context,
 	rs *RequestState) (sm.Result, error) {
 	select {
-	case r := <-rs.CompletedC:
+	case r := <-rs.AppliedC():
 		if r.Completed() {
 			return r.GetResult(), nil
 		} else if r.Rejected() {
@@ -1843,36 +1976,23 @@ type INodeUser interface {
 	ReadIndex(timeout time.Duration) (*RequestState, error)
 }
 
-func delaySampled(s *client.Session) bool {
-	if delaySampleRatio == 0 {
-		return false
-	}
-	return s.ClientID%delaySampleRatio == 0
-}
+var _ INodeUser = &nodeUser{}
 
 type nodeUser struct {
 	nh           *NodeHost
 	node         *node
-	setNodeReady func(clusterID uint64)
+	setStepReady func(clusterID uint64)
 }
 
 func (nu *nodeUser) Propose(s *client.Session,
 	cmd []byte, timeout time.Duration) (*RequestState, error) {
-	var st time.Time
-	sampled := delaySampled(s)
-	if sampled {
-		st = time.Now()
-	}
-	req, err := nu.node.propose(s, cmd, nil, timeout)
-	nu.setNodeReady(s.ClusterID)
-	if sampled {
-		nu.nh.execEngine.proposeDelay(s.ClusterID, st)
-	}
+	req, err := nu.node.propose(s, cmd, nu.nh.getTimeoutTick(timeout))
+	nu.setStepReady(s.ClusterID)
 	return req, err
 }
 
 func (nu *nodeUser) ReadIndex(timeout time.Duration) (*RequestState, error) {
-	rs, err := nu.node.read(nil, timeout)
+	rs, err := nu.node.read(nu.nh.getTimeoutTick(timeout))
 	return rs, err
 }
 
@@ -1887,6 +2007,8 @@ func getTimeoutFromContext(ctx context.Context) (time.Duration, error) {
 	}
 	return d.Sub(now), nil
 }
+
+var _ transport.IRaftMessageHandler = &messageHandler{}
 
 type messageHandler struct {
 	nh *NodeHost
@@ -1920,18 +2042,10 @@ func (h *messageHandler) HandleMessageBatch(msg pb.MessageBatch) (uint64, uint64
 			nh.snapshotStatus.confirm(req.ClusterId, req.From, nh.getTick())
 			continue
 		}
-		if req.Type == pb.Ping {
-			h.HandlePingMessage(req)
-			continue
-		}
-		if req.Type == pb.Pong {
-			h.HandlePongMessage(req)
-			continue
-		}
 		_, q, ok := nh.getClusterAndQueueNotLocked(req.ClusterId)
 		if ok {
 			if req.Type == pb.InstallSnapshot {
-				q.AddSnapshot(req)
+				q.MustAdd(req)
 				snapshotCount++
 			} else {
 				if added, stopped := q.Add(req); !added || stopped {
@@ -1940,7 +2054,7 @@ func (h *messageHandler) HandleMessageBatch(msg pb.MessageBatch) (uint64, uint64
 					msgCount++
 				}
 			}
-			nh.execEngine.setNodeReady(req.ClusterId)
+			nh.execEngine.setStepReady(req.ClusterId)
 		}
 	}
 	return snapshotCount, msgCount
@@ -1949,29 +2063,27 @@ func (h *messageHandler) HandleMessageBatch(msg pb.MessageBatch) (uint64, uint64
 func (h *messageHandler) HandleSnapshotStatus(clusterID uint64,
 	nodeID uint64, failed bool) {
 	tick := h.nh.getTick()
+	if failed {
+		h.nh.sysListener.Publish(server.SystemEvent{
+			Type:      server.SendSnapshotAborted,
+			ClusterID: clusterID,
+			NodeID:    nodeID,
+		})
+	} else {
+		h.nh.sysListener.Publish(server.SystemEvent{
+			Type:      server.SendSnapshotCompleted,
+			ClusterID: clusterID,
+			NodeID:    nodeID,
+		})
+	}
 	h.nh.snapshotStatus.addStatus(clusterID, nodeID, failed, tick)
 }
 
 func (h *messageHandler) HandleUnreachable(clusterID uint64, nodeID uint64) {
-	// this is called from a worker thread that is no longer serving anything
-	cluster, q, ok := h.nh.getClusterAndQueueNotLocked(clusterID)
+	_, q, ok := h.nh.getClusterAndQueueNotLocked(clusterID)
 	if ok {
-		m := pb.Message{Type: pb.Unreachable, From: nodeID}
-		for {
-			added, stopped := q.Add(m)
-			if added || stopped {
-				break
-			}
-			select {
-			case <-h.nh.stopper.ShouldStop():
-				return
-			case <-cluster.shouldStop():
-				return
-			default:
-			}
-			time.Sleep(time.Millisecond)
-		}
-		h.nh.execEngine.setNodeReady(clusterID)
+		q.MustAdd(pb.Message{Type: pb.Unreachable, From: nodeID})
+		h.nh.execEngine.setStepReady(clusterID)
 	}
 }
 
@@ -1985,27 +2097,12 @@ func (h *messageHandler) HandleSnapshot(clusterID uint64,
 	}
 	h.nh.sendMessage(msg)
 	plog.Infof("%s sent MsgSnapshotReceived to %d", dn(clusterID, nodeID), from)
-}
-
-func (h *messageHandler) HandlePingMessage(msg pb.Message) {
-	resp := pb.Message{
-		Type:      pb.Pong,
-		To:        msg.From,
-		From:      msg.To,
-		ClusterId: msg.ClusterId,
-		Term:      msg.Term,
-		Hint:      msg.Hint,
-	}
-	h.nh.transport.ASyncSend(resp)
-}
-
-func (h *messageHandler) HandlePongMessage(msg pb.Message) {
-	// not using the monotonic clock here
-	// it is probably ok for now as we just want to get a rough idea of the
-	// transport latency for manual code analysis/optimization purposes
-	ts := h.nh.transportLatency
-	startTime := time.Unix(0, int64(msg.Hint))
-	ts.record(startTime)
+	h.nh.sysListener.Publish(server.SystemEvent{
+		Type:      server.SnapshotReceived,
+		ClusterID: clusterID,
+		NodeID:    nodeID,
+		From:      from,
+	})
 }
 
 func logBuildTagsAndVersion() {
@@ -2017,7 +2114,10 @@ func logBuildTagsAndVersion() {
 	plog.Infof("dragonboat version: %d.%d.%d (%s)",
 		DragonboatMajor, DragonboatMinor, DragonboatPatch, devstr)
 	plog.Infof("raft entry encoding scheme: %s", pb.RaftEntryEncodingScheme)
-	if runtime.GOOS == "darwin" {
-		plog.Warningf("Running on darwin, don't use for production purposes")
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		plog.Warningf("running on %s, don't use for production purposes",
+			runtime.GOOS)
 	}
 }
+
+var _ nodeLoader = &NodeHost{}

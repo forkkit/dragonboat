@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 // Copyright 2015 The etcd Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,20 +19,22 @@ package logdb
 
 import (
 	"math"
-	"os"
 	"reflect"
 	"testing"
 
 	"github.com/lni/dragonboat/v3/internal/raft"
+	"github.com/lni/dragonboat/v3/internal/vfs"
 	pb "github.com/lni/dragonboat/v3/raftpb"
 )
 
-func removeTestLogdbDir() {
-	os.RemoveAll(RDBTestDirectory)
+func removeTestLogdbDir(fs vfs.IFS) {
+	if err := fs.RemoveAll(RDBTestDirectory); err != nil {
+		panic(err)
+	}
 }
 
 func getTestLogReaderWithoutCache(entries []pb.Entry) *LogReader {
-	logdb := getNewLogReaderTestDB(entries)
+	logdb := getNewLogReaderTestDB(entries, vfs.GetTestFS())
 	ls := NewLogReader(LogReaderTestClusterID, LogReaderTestNodeID, logdb)
 	if len(entries) > 0 {
 		if err := ls.Append(entries); err != nil {
@@ -65,7 +67,7 @@ func TestRLLTFindConflict(t *testing.T) {
 		{[]pb.Entry{{Index: 3, Term: 1}, {Index: 4, Term: 2}, {Index: 5, Term: 4}, {Index: 6, Term: 4}}, 3},
 	}
 	stable := getTestLogReaderWithoutCache(previousEnts)
-	defer removeTestLogdbDir()
+	defer removeTestLogdbDir(vfs.GetTestFS())
 	defer stable.logdb.(*ShardedRDB).Close()
 	for i, tt := range tests {
 		raftLog := raft.NewLog(stable)
@@ -79,7 +81,7 @@ func TestRLLTFindConflict(t *testing.T) {
 func TestRLLTIsUpToDate(t *testing.T) {
 	previousEnts := []pb.Entry{{Index: 1, Term: 1}, {Index: 2, Term: 2}, {Index: 3, Term: 3}}
 	stable := getTestLogReaderWithoutCache(previousEnts)
-	defer removeTestLogdbDir()
+	defer removeTestLogdbDir(vfs.GetTestFS())
 	defer stable.logdb.(*ShardedRDB).Close()
 	raftLog := raft.NewLog(stable)
 	tests := []struct {
@@ -167,7 +169,7 @@ func TestRLLTAppend(t *testing.T) {
 			t.Errorf("#%d: unstable = %d, want %d", i, goff, tt.wunstable)
 		}
 		stable.logdb.(*ShardedRDB).Close()
-		removeTestLogdbDir()
+		removeTestLogdbDir(vfs.GetTestFS())
 	}
 }
 
@@ -297,7 +299,7 @@ func TestRLLTLogMaybeAppend(t *testing.T) {
 			}
 		}()
 		stable.logdb.(*ShardedRDB).Close()
-		removeTestLogdbDir()
+		removeTestLogdbDir(vfs.GetTestFS())
 	}
 }
 
@@ -411,7 +413,7 @@ func TestRLLTHasNextEnts(t *testing.T) {
 		}
 
 		stable.logdb.(*ShardedRDB).Close()
-		removeTestLogdbDir()
+		removeTestLogdbDir(vfs.GetTestFS())
 	}
 }
 
@@ -451,7 +453,7 @@ func TestRLLTNextEnts(t *testing.T) {
 		}
 
 		stable.logdb.(*ShardedRDB).Close()
-		removeTestLogdbDir()
+		removeTestLogdbDir(vfs.GetTestFS())
 	}
 }
 
@@ -526,7 +528,7 @@ func TestRLLTCompaction(t *testing.T) {
 			}
 		}()
 		stable.logdb.(*ShardedRDB).Close()
-		removeTestLogdbDir()
+		removeTestLogdbDir(vfs.GetTestFS())
 	}
 }
 
@@ -556,7 +558,7 @@ func TestRLLTLogRestore(t *testing.T) {
 	}
 
 	stable.logdb.(*ShardedRDB).Close()
-	removeTestLogdbDir()
+	removeTestLogdbDir(vfs.GetTestFS())
 }
 
 func TestRLLTIsOutOfBounds(t *testing.T) {
@@ -646,7 +648,7 @@ func TestRLLTIsOutOfBounds(t *testing.T) {
 	}
 
 	stable.logdb.(*ShardedRDB).Close()
-	removeTestLogdbDir()
+	removeTestLogdbDir(vfs.GetTestFS())
 }
 
 func TestRLLTTerm(t *testing.T) {
@@ -684,7 +686,7 @@ func TestRLLTTerm(t *testing.T) {
 	}
 
 	stable.logdb.(*ShardedRDB).Close()
-	removeTestLogdbDir()
+	removeTestLogdbDir(vfs.GetTestFS())
 }
 
 // not related to logstable
@@ -774,7 +776,7 @@ func TestRLLTSlice(t *testing.T) {
 	}
 
 	stable.logdb.(*ShardedRDB).Close()
-	removeTestLogdbDir()
+	removeTestLogdbDir(vfs.GetTestFS())
 }
 
 func mustTerm(term uint64, err error) uint64 {

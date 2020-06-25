@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Reusee (https://github.com/reusee)
+// Copyright 2017-2020 Reusee (https://github.com/reusee)
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -38,9 +38,9 @@ import (
 	"hash"
 	"io"
 	"math"
-	"os"
 
 	"github.com/lni/dragonboat/v3/internal/settings"
+	"github.com/lni/dragonboat/v3/internal/vfs"
 	pb "github.com/lni/dragonboat/v3/raftpb"
 )
 
@@ -68,32 +68,6 @@ func getChecksumedBlockSize(sz uint64, blockSize uint64) uint64 {
 	return uint64(math.Ceil(float64(sz)/float64(blockSize)))*checksumSize + sz
 }
 
-func validateHeaderRecord(header pb.SnapshotHeader) bool {
-	checksum := header.HeaderChecksum
-	header.HeaderChecksum = nil
-	if header.ChecksumType != pb.CRC32IEEE {
-		plog.Errorf("unsupported checksum type %d", header.ChecksumType)
-		return false
-	}
-	version := SSVersion(header.Version)
-	if version != V1SnapshotVersion && version != V2SnapshotVersion {
-		plog.Errorf("unsupported version %d", header.Version)
-		return false
-	}
-	data, err := header.Marshal()
-	if err != nil {
-		panic(err)
-	}
-	headerHash, ok := getChecksum(header.ChecksumType)
-	if !ok {
-		return false
-	}
-	if _, err := headerHash.Write(data); err != nil {
-		panic(err)
-	}
-	return bytes.Equal(headerHash.Sum(nil), checksum)
-}
-
 func validateBlock(block []byte, h hash.Hash) bool {
 	if uint64(len(block)) <= checksumSize {
 		return false
@@ -107,6 +81,8 @@ func validateBlock(block []byte, h hash.Hash) bool {
 	}
 	return bytes.Equal(crc, h.Sum(nil))
 }
+
+var _ IBlockWriter = &BlockWriter{}
 
 // BlockWriter is a writer type that writes the input data to the underlying
 // storage with checksum appended at the end of each block.
@@ -285,6 +261,11 @@ func (br *blockReader) readBlock() (int, error) {
 	return len(br.block), nil
 }
 
+var _ IVWriter = &v1writer{}
+var _ IVWriter = &v2writer{}
+var _ IVReader = &v1reader{}
+var _ IVReader = &v2reader{}
+
 // IVWriter is the interface for versioned snapshot writer.
 type IVWriter interface {
 	Write(data []byte) (int, error)
@@ -419,6 +400,9 @@ func getHeaderFromFirstChunk(data []byte) ([]byte, []byte, bool) {
 	return header, crc, true
 }
 
+var _ IVValidator = &v1validator{}
+var _ IVValidator = &v2validator{}
+
 // IVValidator is the interface for versioned validator.
 type IVValidator interface {
 	AddChunk(data []byte, chunkID uint64) bool
@@ -529,17 +513,17 @@ func (v *v2validator) validateBlock(block []byte) bool {
 
 // GetV2PayloadChecksum calculates the payload checksum of the specified
 // snapshot file.
-func GetV2PayloadChecksum(fp string) (crc []byte, err error) {
-	offsets, err := getV2CRCOffsetList(fp)
+func GetV2PayloadChecksum(fp string, fs vfs.IFS) (crc []byte, err error) {
+	offsets, err := getV2CRCOffsetList(fp, fs)
 	if err != nil {
 		return nil, err
 	}
-	t, err := getV2ChecksumType(fp)
+	t, err := getV2ChecksumType(fp, fs)
 	if err != nil {
 		return nil, err
 	}
 	h := mustGetChecksum(t)
-	f, err := os.OpenFile(fp, os.O_RDONLY, 0)
+	f, err := fs.Open(fp)
 	if err != nil {
 		return nil, err
 	}
@@ -549,14 +533,12 @@ func GetV2PayloadChecksum(fp string) (crc []byte, err error) {
 		}
 	}()
 	for _, offset := range offsets {
-		if _, err := f.Seek(int64(offset), 0); err != nil {
-			return nil, err
-		}
 		crc := make([]byte, checksumSize)
-		if _, err := io.ReadFull(f, crc); err != nil {
+		_, err := f.ReadAt(crc, int64(offset))
+		if err != nil {
 			return nil, err
 		}
-		if _, err := h.Write(crc); err != nil {
+		if _, err = h.Write(crc); err != nil {
 			return nil, err
 		}
 	}
@@ -564,8 +546,8 @@ func GetV2PayloadChecksum(fp string) (crc []byte, err error) {
 	return
 }
 
-func getV2ChecksumType(fp string) (ct pb.ChecksumType, err error) {
-	reader, err := NewSnapshotReader(fp)
+func getV2ChecksumType(fp string, fs vfs.IFS) (ct pb.ChecksumType, err error) {
+	reader, err := NewSnapshotReader(fp, fs)
 	if err != nil {
 		return 0, err
 	}
@@ -584,8 +566,8 @@ func getV2ChecksumType(fp string) (ct pb.ChecksumType, err error) {
 	return header.ChecksumType, nil
 }
 
-func getV2CRCOffsetList(fp string) ([]uint64, error) {
-	fi, err := os.Stat(fp)
+func getV2CRCOffsetList(fp string, fs vfs.IFS) ([]uint64, error) {
+	fi, err := fs.Stat(fp)
 	if err != nil {
 		return nil, err
 	}

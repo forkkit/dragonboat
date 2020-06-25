@@ -16,10 +16,31 @@ package raftpb
 
 import (
 	"math"
+	"math/rand"
+	"reflect"
 	"testing"
+	"unsafe"
+
+	proto "github.com/golang/protobuf/proto"
 
 	"github.com/lni/dragonboat/v3/client"
 )
+
+func TestCanUsedWithEtcd(t *testing.T) {
+	var names = map[int32]string{
+		0: "EntryNormal",
+		1: "EntryConfChange",
+		2: "EntryConfChangeV2",
+	}
+	var values = map[string]int32{
+		"EntryNormal":       0,
+		"EntryConfChange":   1,
+		"EntryConfChangeV2": 2,
+	}
+	// init() need to be commented out in raft.pb.go
+	// otherwise it is going to conflict with the etcd definition
+	proto.RegisterEnum("raftpb.EntryType", names, values)
+}
 
 func TestBootstrapValidateHandlesJoiningNode(t *testing.T) {
 	bootstrap := Bootstrap{Join: true}
@@ -403,4 +424,59 @@ func TestGetEntrySliceInMemSize(t *testing.T) {
 			t.Errorf("%d, result %d, want %d", idx, result, tt.size)
 		}
 	}
+}
+
+func TestMetadataEntry(t *testing.T) {
+	me := Entry{
+		Type:  MetadataEntry,
+		Index: 200,
+		Term:  5,
+	}
+	if !me.IsEmpty() {
+		t.Errorf("IsEmpty returned false")
+	}
+	if me.IsSessionManaged() {
+		t.Errorf("IsSessionManaged returned true")
+	}
+	if !me.IsNoOPSession() {
+		t.Errorf("IsNoOPSession returned false")
+	}
+	if me.IsNewSessionRequest() || me.IsEndOfSessionRequest() {
+		t.Errorf("not suppose to be session related")
+	}
+	if me.IsUpdateEntry() {
+		t.Errorf("IsUpdateEntry returned true")
+	}
+}
+
+func TestEntryCanBeMarshalledAndUnmarshalled(t *testing.T) {
+	cmd := make([]byte, 1024)
+	rand.Read(cmd)
+	e := Entry{
+		Type:        MetadataEntry,
+		Index:       200,
+		Term:        5,
+		Key:         12345678,
+		ClientID:    7654321,
+		RespondedTo: 13579,
+		Cmd:         cmd,
+	}
+	m, err := e.Marshal()
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	e2 := Entry{}
+	if err := e2.Unmarshal(m); err != nil {
+		t.Fatalf("%v", err)
+	}
+	if !reflect.DeepEqual(&e, &e2) {
+		t.Fatalf("entry changed")
+	}
+	sh1 := (*reflect.SliceHeader)(unsafe.Pointer(&e.Cmd))
+	sh2 := (*reflect.SliceHeader)(unsafe.Pointer(&e2.Cmd))
+	if !(sh2.Data+uintptr(sh2.Len) <= sh1.Data ||
+		sh2.Data >= sh1.Data+uintptr(sh1.Len)) {
+		t.Fatalf("overlapping slice")
+	}
+
 }

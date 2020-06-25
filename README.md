@@ -8,19 +8,20 @@
 [![Join the chat at https://gitter.im/lni/dragonboat](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/lni/dragonboat?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 
 ## News ##
+* 2020-03-05 Dragonboat v3.2 has been released, please check [CHANGELOG](CHANGELOG.md) for details.
 * 2019-07-04 Dragonboat v3.1 has been released, please read [CHANGELOG](CHANGELOG.md) before you upgrade.
 * 2019-06-21 Dragonboat v3.0 has been released with on disk state machine and Go module support ([CHANGELOG](CHANGELOG.md)).
 * 2019-02-20 Dragonboat v2.1 has been released.
 
 ## About ##
-Dragonboat is a high performance multi-group [Raft](https://raft.github.io/) [consensus](https://en.wikipedia.org/wiki/Consensus_(computer_science)) library in [Go](https://golang.org/) with [C++11 binding](/binding) support.
+Dragonboat is a high performance multi-group [Raft](https://raft.github.io/) [consensus](https://en.wikipedia.org/wiki/Consensus_(computer_science)) library in [Go](https://golang.org/).
 
 Consensus algorithms such as Raft provides fault-tolerance by alllowing a system continue to operate as long as the majority member servers are available. For example, a Raft cluster of 5 servers can make progress even if 2 servers fail. It also appears to clients as a single node with strong data consistency always provided. All running servers can be used to initiate read requests for aggregated read throughput.
 
 Dragonboat handles all technical difficulties associated with Raft to allow users to just focus on their application domains. It is also very easy to use, our step-by-step [examples](https://github.com/lni/dragonboat-example) can help new users to master it in half an hour.
 
 ## Features ##
-* Easy to use API for building Raft based applications in Go or C++
+* Easy to use API for building Raft based applications
 * Feature complete and scalable multi-group Raft implementation
 * Disk based and memory based state machine support
 * Fully pipelined and TLS mutual authentication support, ready for high latency open environment
@@ -31,18 +32,19 @@ Dragonboat handles all technical difficulties associated with Raft to allow user
 
 Most features covered in Diego Ongaro's [Raft thesis](https://ramcloud.stanford.edu/~ongaro/thesis.pdf) have been supported -
 * leader election, log replication, snapshotting and log compaction
-* membership changes
+* membership change
 * ReadIndex protocol for read-only queries
 * leadership transfer
-* non-voting members
-* idempotent updates transparent to applications
+* non-voting member
+* witness member
+* idempotent update transparent to applications
 * batching and pipelining
 * disk based state machine
 
 ## Performance ##
 Dragonboat is the __fastest__ open source multi-group Raft implementation on Github. 
 
-For 3-nodes system using mid-range hardware (details [here](docs/test.md)) and in-memory state machine, Dragonboat can sustain at 9 million writes per second when the payload is 16bytes each or 11 million mixed I/O per second at 9:1 read:write ratio. High throughput is maintained in geographically distributed environment. When the RTT between nodes is 30ms, 2 million I/O per second can still be achieved using a much larger number of clients.
+For 3-nodes system using mid-range hardware (details [here](docs/test.md)) and in-memory state machine, when RocksDB is used as the storage engine, Dragonboat can sustain at 9 million writes per second when the payload is 16bytes each or 11 million mixed I/O per second at 9:1 read:write ratio. High throughput is maintained in geographically distributed environment. When the RTT between nodes is 30ms, 2 million I/O per second can still be achieved using a much larger number of clients.
 ![throughput](./docs/throughput.png)
 
 The number of concurrent active Raft groups affects the overall throughput as requests become harder to be batched. On the other hand, having thousands of idle Raft groups has a much smaller impact on throughput.
@@ -65,56 +67,21 @@ As visualized below, Stop-the-World pauses caused by Go1.11's GC are sub-millise
 ![stw](./docs/stw.png)
 
 ## Requirements ##
-* x86_64 Linux or MacOS, Go 1.13 or 1.12, GCC or Clang with C++11 support
-* [RocksDB](https://github.com/facebook/rocksdb/blob/master/INSTALL.md) 5.13.4 or above when using RocksDB for storing Raft logs 
+* x86_64 Linux or MacOS, Go 1.14 or 1.13
 
 ## Getting Started ##
-__Master is our unstable branch for development. Please use released versions for any production purposes.__ 
+__Master is our unstable branch for development. Please use the latest released versions for any production purposes.__ For Dragonboat v3.2.x, please follow the instructions in v3.2.x's [README.md](https://github.com/lni/dragonboat/blob/release-3.2/README.md). 
 
-Make sure Go 1.12 or above has been installed. Instructions below require [Go module](https://github.com/golang/go/wiki/Modules) support.
+Go 1.13 or above with [Go module](https://github.com/golang/go/wiki/Modules) support is required.
 
-You need to decide whether to use [RocksDB or LevelDB](docs/storage.md) to store Raft logs. RocksDB is recommended. 
+To use Dragonboat, make sure to import the package __github.com/lni/dragonboat/v3__. Also add "github.com/lni/dragonboat/v3 v3.2.0" to the __require__ section of your project's go.mod file.
 
-### Install RocksDB ###
-If RocksDB 5.13.4 or above has not already been installed, follow the steps below to install it first.
+By default, [Pebble](https://github.com/cockroachdb/pebble) is used for storing Raft Logs in Dragonboat. RocksDB and other storage engines are also supported, more info [here](docs/storage.md).
 
-To download Dragonboat to $HOME/src and install RocksDB to /usr/local/lib and /usr/local/include:
-```
-$ cd $HOME/src
-$ git clone https://github.com/lni/dragonboat
-$ cd $HOME/src/dragonboat
-$ make install-rocksdb-ull
-```
-Run built-in tests to check the installation:
-```
-$ cd $HOME/src/dragonboat
-$ GO111MODULE=on make dragonboat-test
-```
-Once completed, $HOME/src/dragonboat can be safely deleted if you just plan to use dragonboat in your application.
-
-### Use Dragonboat ###
-To use dragonboat in your application, make sure to import the package __github.com/lni/dragonboat/v3__ in your Go code. Also add "github.com/lni/dragonboat/v3 v3.1.0" to the __require__ section of your project's go.mod file.
-
-When building your application, you may need to tell Go where is the installed RocksDB library:
-```
-CGO_CFLAGS="-I/path/to/rocksdb/include" CGO_LDFLAGS="-L/path/to/rocksdb/lib -lrocksdb" go build -v pkgname
-```
-You can also follow our [examples](https://github.com/lni/dragonboat-example) on how to use Dragonboat.
-
-### Use LevelDB ###
-No extra dependency is required when choosing to use LevelDB based Raft log storage.
-
-To use LevelDB based Raft log storage in your application, set the LogDBFactory field of your config.NodeHostConfig to the factory function leveldb.NewLogDB provided in the github.com/lni/dragonboat/v3/plugin/leveldb package.
-
-To build the your application when you don't have RocksDB installed:
-```
-go build -v -tags="dragonboat_no_rocksdb" pkgname
-```
+You can also follow our [examples](https://github.com/lni/dragonboat-example) on how to use Dragonboat. 
 
 ## Documents ##
 [FAQ](https://github.com/lni/dragonboat/wiki/FAQ), [docs](https://godoc.org/github.com/lni/dragonboat), step-by-step [examples](https://github.com/lni/dragonboat-example), [DevOps doc](docs/devops.md), [CHANGELOG](CHANGELOG.md) and [online chat](https://gitter.im/lni/dragonboat) are available.
-
-C++ Binding info can be found [here](https://github.com/lni/dragonboat/blob/master/binding/README.md).
 
 ## Examples ##
 Dragonboat examples are [here](https://github.com/lni/dragonboat-example).

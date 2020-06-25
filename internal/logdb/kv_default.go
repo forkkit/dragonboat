@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,15 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build !dragonboat_no_rocksdb
-// +build !dragonboat_pebble_test
-// +build !dragonboat_leveldb_test
+// +build !dragonboat_rocksdb_test
+// +build !dragonboat_memfs_test
 
 package logdb
 
 import (
+	"github.com/lni/dragonboat/v3/config"
 	"github.com/lni/dragonboat/v3/internal/logdb/kv"
-	"github.com/lni/dragonboat/v3/internal/logdb/kv/rocksdb"
+	"github.com/lni/dragonboat/v3/internal/logdb/kv/pebble"
+	"github.com/lni/dragonboat/v3/internal/vfs"
 )
 
 const (
@@ -28,6 +29,12 @@ const (
 	DefaultKVStoreTypeName = "rocksdb"
 )
 
-func newDefaultKVStore(dir string, wal string) (kv.IKVStore, error) {
-	return rocksdb.NewKVStore(dir, wal)
+func newDefaultKVStore(config config.LogDBConfig,
+	dir string, wal string, fs vfs.IFS) (kv.IKVStore, error) {
+	if fs != vfs.DefaultFS {
+		if _, ok := fs.(*vfs.ErrorFS); !ok {
+			panic("invalid fs")
+		}
+	}
+	return pebble.NewKVStore(config, dir, wal, fs)
 }

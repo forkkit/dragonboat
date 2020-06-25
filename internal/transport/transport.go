@@ -1,20 +1,4 @@
-// Copyright 2014 The Cockroach Authors.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-//
-//
-//
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -33,6 +17,19 @@
 // pattern used in ASyncSend/connectAndProcess/connectAndProcess is similar
 // to the one used in CockroachDB.
 //
+// Copyright 2014 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
 
 /*
 Package transport implements the transport component used for exchanging
@@ -46,30 +43,27 @@ package transport
 import (
 	"context"
 	"errors"
-	"fmt"
-	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/lni/dragonboat/v3/config"
-	"github.com/lni/dragonboat/v3/internal/server"
-	"github.com/lni/dragonboat/v3/internal/settings"
-	"github.com/lni/dragonboat/v3/logger"
-	"github.com/lni/dragonboat/v3/raftio"
-	pb "github.com/lni/dragonboat/v3/raftpb"
 	"github.com/lni/goutils/logutil"
 	"github.com/lni/goutils/netutil"
 	"github.com/lni/goutils/netutil/rubyist/circuitbreaker"
 	"github.com/lni/goutils/syncutil"
+
+	"github.com/lni/dragonboat/v3/config"
+	"github.com/lni/dragonboat/v3/internal/server"
+	"github.com/lni/dragonboat/v3/internal/settings"
+	"github.com/lni/dragonboat/v3/internal/vfs"
+	"github.com/lni/dragonboat/v3/logger"
+	ct "github.com/lni/dragonboat/v3/plugin/chan"
+	"github.com/lni/dragonboat/v3/raftio"
+	pb "github.com/lni/dragonboat/v3/raftpb"
 )
 
 const (
 	maxMsgBatchSize = settings.MaxMessageBatchSize
-	// UnmanagedDeploymentID is the special DeploymentID used when the system is
-	// not managed by master servers.
-	UnmanagedDeploymentID = uint64(1)
 )
 
 var (
@@ -80,9 +74,9 @@ var (
 	plog                = logger.GetLogger("transport")
 	streamConnections   = settings.Soft.StreamConnections
 	sendQueueLen        = settings.Soft.SendQueueLength
+	dialTimeoutSecond   = settings.Soft.GetConnectedTimeoutSecond
 	errChunkSendSkipped = errors.New("chunk is skipped")
 	errBatchSendSkipped = errors.New("raft request batch is skipped")
-	dialTimeoutSecond   = settings.Soft.GetConnectedTimeoutSecond
 	idleTimeout         = time.Minute
 	dn                  = logutil.DescribeNode
 )
@@ -92,7 +86,7 @@ var (
 type INodeAddressResolver interface {
 	Resolve(uint64, uint64) (string, string, error)
 	ReverseResolve(string) []raftio.NodeInfo
-	AddRemoteAddress(uint64, uint64, string)
+	AddRemote(uint64, uint64, string)
 }
 
 // IRaftMessageHandler is the interface required to handle incoming raft
@@ -108,13 +102,10 @@ type IRaftMessageHandler interface {
 // Raft messages.
 type ITransport interface {
 	Name() string
-	SetUnmanagedDeploymentID()
-	SetDeploymentID(uint64)
 	SetMessageHandler(IRaftMessageHandler)
-	RemoveMessageHandler()
-	ASyncSend(pb.Message) bool
-	ASyncSendSnapshot(pb.Message) bool
-	GetStreamConnection(clusterID uint64, nodeID uint64) *Sink
+	Send(pb.Message) bool
+	SendSnapshot(pb.Message) bool
+	GetStreamSink(clusterID uint64, nodeID uint64) *Sink
 	Stop()
 }
 
@@ -124,42 +115,11 @@ type ITransport interface {
 
 // StreamChunkSendFunc is a func type that is used to determine whether a
 // snapshot chunk should indeed be sent. This func is used in test only.
-type StreamChunkSendFunc func(pb.SnapshotChunk) (pb.SnapshotChunk, bool)
+type StreamChunkSendFunc func(pb.Chunk) (pb.Chunk, bool)
 
 // SendMessageBatchFunc is a func type that is used to determine whether the
 // specified message batch should be sent. This func is used in test only.
 type SendMessageBatchFunc func(pb.MessageBatch) (pb.MessageBatch, bool)
-
-// DeploymentID struct is the manager type used to manage the deployment id
-// value.
-type DeploymentID struct {
-	deploymentID uint64
-}
-
-func (d *DeploymentID) deploymentIDSet() bool {
-	v := atomic.LoadUint64(&d.deploymentID)
-	return v != 0
-}
-
-// SetUnmanagedDeploymentID sets the deployment id to indicate that the user
-// is not managed.
-func (d *DeploymentID) SetUnmanagedDeploymentID() {
-	d.SetDeploymentID(UnmanagedDeploymentID)
-}
-
-// SetDeploymentID sets the deployment id to the specified value.
-func (d *DeploymentID) SetDeploymentID(x uint64) {
-	v := atomic.LoadUint64(&d.deploymentID)
-	if v != 0 {
-		panic("trying to set deployment id again")
-	} else {
-		atomic.StoreUint64(&d.deploymentID, x)
-	}
-}
-
-func (d *DeploymentID) getDeploymentID() uint64 {
-	return atomic.LoadUint64(&d.deploymentID)
-}
 
 type sendQueue struct {
 	ch chan pb.Message
@@ -184,26 +144,31 @@ func (sq *sendQueue) decrease(msg pb.Message) {
 	sq.rl.Decrease(pb.GetEntrySliceInMemSize(msg.Entries))
 }
 
+// ITransportEvent is the interface for notifying connection status changes.
+type ITransportEvent interface {
+	ConnectionEstablished(string, bool)
+	ConnectionFailed(string, bool)
+}
+
+var _ ITransport = &Transport{}
+
 // Transport is the transport layer for delivering raft messages and snapshots.
 type Transport struct {
-	DeploymentID
 	mu struct {
 		sync.Mutex
 		// each (cluster id, node id) pair has its own queue and breaker
 		queues   map[string]sendQueue
 		breakers map[string]*circuit.Breaker
 	}
-	lanes               uint32
+	jobs                uint32
 	metrics             *transportMetrics
 	serverCtx           *server.Context
 	nhConfig            config.NodeHostConfig
 	sourceAddress       string
 	resolver            INodeAddressResolver
 	stopper             *syncutil.Stopper
-	cstopper            *syncutil.Stopper
-	snapshotLocator     server.GetSnapshotDirFunc
-	raftRPC             raftio.IRaftRPC
-	handlerRemovedFlag  uint32
+	folder              server.GetSnapshotDirFunc
+	trans               raftio.IRaftRPC
 	handler             atomic.Value
 	streamChunkSent     atomic.Value
 	preStreamChunkSend  atomic.Value // StreamChunkSendFunc
@@ -211,12 +176,15 @@ type Transport struct {
 	ctx                 context.Context
 	cancel              context.CancelFunc
 	streamConnections   uint64
+	sysEvents           ITransportEvent
+	fs                  vfs.IFS
 }
 
 // NewTransport creates a new Transport object.
 func NewTransport(nhConfig config.NodeHostConfig,
 	ctx *server.Context, resolver INodeAddressResolver,
-	locator server.GetSnapshotDirFunc) (*Transport, error) {
+	folder server.GetSnapshotDirFunc, sysEvents ITransportEvent,
+	fs vfs.IFS) (*Transport, error) {
 	address := nhConfig.RaftAddress
 	t := &Transport{
 		nhConfig:          nhConfig,
@@ -224,28 +192,28 @@ func NewTransport(nhConfig config.NodeHostConfig,
 		sourceAddress:     address,
 		resolver:          resolver,
 		stopper:           syncutil.NewStopper(),
-		cstopper:          syncutil.NewStopper(),
-		snapshotLocator:   locator,
+		folder:            folder,
 		streamConnections: streamConnections,
+		sysEvents:         sysEvents,
+		fs:                fs,
 	}
-	chunks := NewSnapshotChunks(t.handleRequest,
-		t.snapshotReceived, t.getDeploymentID, t.snapshotLocator)
-	raftRPC := createTransportRPC(nhConfig, t.handleRequest, chunks)
-	plog.Infof("transport type: %s", raftRPC.Name())
-	t.raftRPC = raftRPC
-	if err := t.raftRPC.Start(); err != nil {
+	chunks := NewChunks(t.handleRequest,
+		t.snapshotReceived, t.folder, t.nhConfig.GetDeploymentID(), fs)
+	t.trans = createTransport(nhConfig, t.handleRequest, chunks)
+	plog.Infof("transport type: %s", t.trans.Name())
+	if err := t.trans.Start(); err != nil {
 		plog.Errorf("transport rpc failed to start %v", err)
-		t.raftRPC.Stop()
+		t.trans.Stop()
 		return nil, err
 	}
-	t.cstopper.RunWorker(func() {
+	t.stopper.RunWorker(func() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
 				chunks.Tick()
-			case <-t.cstopper.ShouldStop():
+			case <-t.stopper.ShouldStop():
 				chunks.Close()
 				return
 			}
@@ -260,7 +228,7 @@ func NewTransport(nhConfig config.NodeHostConfig,
 		return float64(len(t.mu.queues))
 	}
 	ssCount := func() float64 {
-		return float64(atomic.LoadUint32(&t.lanes))
+		return float64(atomic.LoadUint32(&t.jobs))
 	}
 	t.metrics = newTransportMetrics(true, msgConn, ssCount)
 	return t, nil
@@ -268,12 +236,12 @@ func NewTransport(nhConfig config.NodeHostConfig,
 
 // Name returns the type name of the transport module
 func (t *Transport) Name() string {
-	return t.raftRPC.Name()
+	return t.trans.Name()
 }
 
-// GetRaftRPC returns the raft RPC instance.
-func (t *Transport) GetRaftRPC() raftio.IRaftRPC {
-	return t.raftRPC
+// GetTrans returns the raft RPC instance.
+func (t *Transport) GetTrans() raftio.IRaftRPC {
+	return t.trans
 }
 
 // SetPreSendMessageBatchHook set the SendMessageBatch hook.
@@ -292,8 +260,7 @@ func (t *Transport) SetPreStreamChunkSendHook(h StreamChunkSendFunc) {
 func (t *Transport) Stop() {
 	t.cancel()
 	t.stopper.Stop()
-	t.raftRPC.Stop()
-	t.cstopper.Stop()
+	t.trans.Stop()
 }
 
 // GetCircuitBreaker returns the circuit breaker used for the specified
@@ -319,16 +286,8 @@ func (t *Transport) SetMessageHandler(handler IRaftMessageHandler) {
 	t.handler.Store(handler)
 }
 
-// RemoveMessageHandler removes the raft message handler.
-func (t *Transport) RemoveMessageHandler() {
-	atomic.StoreUint32(&t.handlerRemovedFlag, 1)
-}
-
 func (t *Transport) handleRequest(req pb.MessageBatch) {
-	if t.handlerRemoved() {
-		return
-	}
-	did := t.getDeploymentID()
+	did := t.nhConfig.GetDeploymentID()
 	if req.DeploymentId != did {
 		plog.Warningf("deployment id does not match %d vs %d, message dropped",
 			req.DeploymentId, did)
@@ -347,7 +306,7 @@ func (t *Transport) handleRequest(req pb.MessageBatch) {
 	if len(addr) > 0 {
 		for _, r := range req.Requests {
 			if r.From != 0 {
-				t.resolver.AddRemoteAddress(r.ClusterId, r.From, addr)
+				t.resolver.AddRemote(r.ClusterId, r.From, addr)
 			}
 		}
 	}
@@ -358,9 +317,6 @@ func (t *Transport) handleRequest(req pb.MessageBatch) {
 
 func (t *Transport) snapshotReceived(clusterID uint64,
 	nodeID uint64, from uint64) {
-	if t.handlerRemoved() {
-		return
-	}
 	handler := t.handler.Load()
 	if handler == nil {
 		return
@@ -369,35 +325,31 @@ func (t *Transport) snapshotReceived(clusterID uint64,
 }
 
 func (t *Transport) sendUnreachableNotification(addr string) {
-	if t.handlerRemoved() {
-		return
-	}
-	handler := t.handler.Load().(IRaftMessageHandler)
+	handler := t.handler.Load()
 	if handler == nil {
 		return
 	}
 	h := handler.(IRaftMessageHandler)
 	edp := t.resolver.ReverseResolve(addr)
-	plog.Infof("node %s becomes unreachable, affecting %d raft nodes, %s",
-		addr, len(edp), sampleNodeInfoList(edp))
+	plog.Infof("%s became unreachable, affecting %d raft nodes", addr, len(edp))
 	for _, rec := range edp {
 		h.HandleUnreachable(rec.ClusterID, rec.NodeID)
 	}
 }
 
-// ASyncSend sends raft messages using RPC
+// Send asynchronously sends raft messages to their target nodes.
 //
-// The generic async send Go pattern used in ASyncSend is found in CockroachDB's
+// The generic async send Go pattern used in Send() is found in CockroachDB's
 // codebase.
-func (t *Transport) ASyncSend(req pb.Message) bool {
-	v := t.asyncSend(req)
+func (t *Transport) Send(req pb.Message) bool {
+	v := t.send(req)
 	if !v {
 		t.metrics.messageSendFailure(1)
 	}
 	return v
 }
 
-func (t *Transport) asyncSend(req pb.Message) bool {
+func (t *Transport) send(req pb.Message) bool {
 	if req.Type == pb.InstallSnapshot {
 		panic("snapshot message must be sent via its own channel.")
 	}
@@ -458,7 +410,7 @@ func (t *Transport) connectAndProcess(clusterID uint64, toNodeID uint64,
 	if err := func() error {
 		plog.Infof("%s is trying to connect to %s",
 			t.sourceAddress, remoteHost)
-		conn, err := t.raftRPC.GetConnection(t.ctx, remoteHost)
+		conn, err := t.trans.GetConnection(t.ctx, remoteHost)
 		if err != nil {
 			plog.Errorf("Nodehost %s failed to get a connection to %s, %v",
 				t.sourceAddress, remoteHost, err)
@@ -467,19 +419,21 @@ func (t *Transport) connectAndProcess(clusterID uint64, toNodeID uint64,
 		defer conn.Close()
 		breaker.Success()
 		if successes == 0 || consecFailures > 0 {
-			plog.Infof("%s, raft RPC stream to %s (%s) established",
+			plog.Infof("%s, message stream to %s (%s) established",
 				dn(clusterID, from), dn(clusterID, toNodeID), remoteHost)
+			t.sysEvents.ConnectionEstablished(remoteHost, false)
 		}
-		return t.processQueue(clusterID, toNodeID, sq, conn)
+		return t.processMessages(clusterID, toNodeID, sq, conn)
 	}(); err != nil {
 		plog.Warningf("breaker %s to %s failed, connect and process failed: %s",
 			t.sourceAddress, remoteHost, err.Error())
 		breaker.Fail()
 		t.metrics.messageConnectionFailure()
+		t.sysEvents.ConnectionFailed(remoteHost, false)
 	}
 }
 
-func (t *Transport) processQueue(clusterID uint64, toNodeID uint64,
+func (t *Transport) processMessages(clusterID uint64, toNodeID uint64,
 	sq sendQueue, conn raftio.IConnection) error {
 	idleTimer := time.NewTimer(idleTimeout)
 	defer idleTimer.Stop()
@@ -488,18 +442,10 @@ func (t *Transport) processQueue(clusterID uint64, toNodeID uint64,
 		SourceAddress: t.sourceAddress,
 		BinVer:        raftio.RPCBinVersion,
 	}
+	did := t.nhConfig.GetDeploymentID()
 	requests := make([]pb.Message, 0)
-	var deploymentIDSet bool
-	var deploymentID uint64
 	for {
 		idleTimer.Reset(idleTimeout)
-		// drop the message if deployment id is not set.
-		if !deploymentIDSet {
-			if t.deploymentIDSet() {
-				deploymentIDSet = true
-				deploymentID = t.getDeploymentID()
-			}
-		}
 		select {
 		case <-t.stopper.ShouldStop():
 			return nil
@@ -521,14 +467,7 @@ func (t *Transport) processQueue(clusterID uint64, toNodeID uint64,
 					done = true
 				}
 			}
-			// loaded enough requests, check whether we have the deployment id
-			if deploymentIDSet {
-				batch.DeploymentId = deploymentID
-			} else {
-				plog.Warningf("Messages dropped as no valid deployment id set")
-				requests = requests[:0]
-				continue
-			}
+			batch.DeploymentId = did
 			twoBatch := false
 			if sz < maxMsgBatchSize || len(requests) == 1 {
 				batch.Requests = requests
@@ -537,14 +476,14 @@ func (t *Transport) processQueue(clusterID uint64, toNodeID uint64,
 				batch.Requests = requests[:len(requests)-1]
 			}
 			if err := t.sendMessageBatch(conn, batch); err != nil {
-				plog.Errorf("Send batch failed, target node %s (%v), %d",
+				plog.Errorf("send batch failed, target %s (%v), %d",
 					dn(clusterID, toNodeID), err, len(batch.Requests))
 				return err
 			}
 			if twoBatch {
 				batch.Requests = []pb.Message{requests[len(requests)-1]}
 				if err := t.sendMessageBatch(conn, batch); err != nil {
-					plog.Errorf("Send batch failed, taret node %s (%v), %d",
+					plog.Errorf("send batch failed, taret node %s (%v), %d",
 						dn(clusterID, toNodeID), err, len(batch.Requests))
 					return err
 				}
@@ -585,10 +524,6 @@ func (t *Transport) sendMessageBatch(conn raftio.IConnection,
 	return nil
 }
 
-func (t *Transport) handlerRemoved() bool {
-	return atomic.LoadUint32(&t.handlerRemovedFlag) == 1
-}
-
 func getDialTimeoutSecond() uint64 {
 	return atomic.LoadUint64(&dialTimeoutSecond)
 }
@@ -597,38 +532,16 @@ func setDialTimeoutSecond(v uint64) {
 	atomic.StoreUint64(&dialTimeoutSecond, v)
 }
 
-func createTransportRPC(nhConfig config.NodeHostConfig,
+func createTransport(nhConfig config.NodeHostConfig,
 	requestHandler raftio.RequestHandler,
 	chunkHandler raftio.IChunkHandler) raftio.IRaftRPC {
 	var factory config.RaftRPCFactoryFunc
 	if nhConfig.RaftRPCFactory != nil {
 		factory = nhConfig.RaftRPCFactory
+	} else if memfsTest {
+		factory = ct.NewChanTransport
 	} else {
 		factory = NewTCPTransport
 	}
 	return factory(nhConfig, requestHandler, chunkHandler)
-}
-
-func sampleNodeInfoList(l []raftio.NodeInfo) string {
-	if len(l) <= 32 {
-		return strings.Join(nodeInfoListToString(l), ",")
-	}
-	other := len(l) - 32
-	fp := l[:16]
-	lp := l[len(l)-16:]
-	return fmt.Sprintf("%s ... and other %d nodes ... %s",
-		strings.Join(nodeInfoListToString(fp), ","), other,
-		strings.Join(nodeInfoListToString(lp), ","))
-}
-
-func nodeInfoListToString(l []raftio.NodeInfo) []string {
-	result := make([]string, 0)
-	for _, rec := range l {
-		s := dn(rec.ClusterID, rec.NodeID)
-		result = append(result, s)
-	}
-	sort.Slice(result, func(i, j int) bool {
-		return strings.Compare(result[i], result[j]) < 0
-	})
-	return result
 }

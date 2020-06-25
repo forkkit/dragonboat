@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,13 +21,18 @@ package config
 import (
 	"crypto/tls"
 	"errors"
+	"path/filepath"
+	"reflect"
+	"time"
+
+	"github.com/lni/goutils/netutil"
+	"github.com/lni/goutils/stringutil"
 
 	"github.com/lni/dragonboat/v3/internal/settings"
+	"github.com/lni/dragonboat/v3/internal/vfs"
 	"github.com/lni/dragonboat/v3/logger"
 	"github.com/lni/dragonboat/v3/raftio"
 	pb "github.com/lni/dragonboat/v3/raftpb"
-	"github.com/lni/goutils/netutil"
-	"github.com/lni/goutils/stringutil"
 )
 
 var (
@@ -41,11 +46,14 @@ type RaftRPCFactoryFunc func(NodeHostConfig,
 
 // LogDBFactoryFunc is the factory function that creates NodeHost's persistent
 // storage module known as Log DB.
-type LogDBFactoryFunc func(dirs []string,
-	lowLatencyDirs []string) (raftio.ILogDB, error)
+type LogDBFactoryFunc func(config LogDBConfig,
+	dirs []string, lowLatencyDirs []string) (raftio.ILogDB, error)
 
 // CompressionType is the type of the compression.
 type CompressionType = pb.CompressionType
+
+// IFS is the filesystem interface used by tests.
+type IFS = vfs.IFS
 
 const (
 	// NoCompression is the CompressionType value used to indicate not to use
@@ -62,16 +70,10 @@ type Config struct {
 	NodeID uint64
 	// ClusterID is the unique value used to identify a Raft cluster.
 	ClusterID uint64
-	// IsObserver indicates whether this is an observer Raft node without voting
-	// power.
-	IsObserver bool
 	// CheckQuorum specifies whether the leader node should periodically check
 	// non-leader node status and step down to become a follower node when it no
 	// longer has the quorum.
 	CheckQuorum bool
-	// Quiesce specifies whether to let the Raft cluster enter quiesce mode when
-	// there is no cluster activity.
-	Quiesce bool
 	// ElectionRTT is the minimum number of message RTT between elections. Message
 	// RTT is defined by NodeHostConfig.RTTMillisecond. The Raft paper suggests it
 	// to be a magnitude greater than HeartbeatRTT, which is the interval between
@@ -104,11 +106,11 @@ type Config struct {
 	// snapshot.
 	//
 	// Once a snapshot is generated, Raft log entries covered by the new snapshot
-	// can be compacted. See the godoc on CompactionOverhead to see what log
-	// entries are actually compacted after taking a snapshot.
-	//
-	// NodeHost.RequestSnapshot can be called to manually request a snapshot to
-	// be created to capture current node state.
+	// can be compacted. This involves two steps, redundant log entries are first
+	// marked as deleted, then they are physically removed from the underlying
+	// storage when a LogDB compaction is issued at a later stage. See the godoc
+	// on CompactionOverhead for details on what log entries are actually removed
+	// and compacted after generating a snapshot.
 	//
 	// Once automatic snapshotting is disabled by setting the SnapshotEntries
 	// field to 0, users can still use NodeHost's RequestSnapshot or
@@ -151,6 +153,34 @@ type Config struct {
 	// payload of user proposals. When Snappy is used, the maximum proposal
 	// payload allowed is roughly limited to 3.42GBytes.
 	EntryCompressionType CompressionType
+	// DisableAutoCompactions disables auto compaction used for reclaiming Raft
+	// entry storage spaces. By default, compaction is issued every time when
+	// a snapshot is captured, this helps to reclaim disk spaces as soon as
+	// possible at the cost of higher IO overhead. Users can disable such auto
+	// compactions and use NodeHost.RequestCompaction to manually request such
+	// compactions when necessary.
+	DisableAutoCompactions bool
+	// IsObserver indicates whether this is an observer Raft node without voting
+	// power. Described as non-voting members in the section 4.2.1 of Diego
+	// Ongaro's thesis, observer nodes are usually used to allow a new node to
+	// join the cluster and catch up with other existing ndoes without impacting
+	// the availability. Extra observer nodes can also be introduced to serve
+	// read-only requests without affecting system write throughput.
+	//
+	// Observer support is currently experimental.
+	IsObserver bool
+	// IsWitness indicates whether this is a witness Raft node without actual log
+	// replication and do not have state machine. It is mentioned in the section
+	// 11.7.2 of Diego Ongaro's thesis.
+	//
+	// Witness support is currently experimental.
+	IsWitness bool
+	// Quiesce specifies whether to let the Raft cluster enter quiesce mode when
+	// there is no cluster activity. Clusters in quiesce mode do not exchange
+	// heartbeat messages to minimize bandwidth consumption.
+	//
+	// Quiesce support is currently experimental.
+	Quiesce bool
 }
 
 // Validate validates the Config instance and return an error when any member
@@ -168,6 +198,9 @@ func (c *Config) Validate() error {
 	if c.ElectionRTT <= 2*c.HeartbeatRTT {
 		return errors.New("invalid election rtt")
 	}
+	if c.ElectionRTT < 10*c.HeartbeatRTT {
+		plog.Warningf("ElectionRTT is not a magnitude larger than HeartbeatRTT")
+	}
 	if c.MaxInMemLogSize > 0 &&
 		c.MaxInMemLogSize < settings.EntryNonCmdFieldsSize+1 {
 		return errors.New("MaxInMemLogSize is too small")
@@ -179,6 +212,12 @@ func (c *Config) Validate() error {
 	if c.EntryCompressionType != Snappy &&
 		c.EntryCompressionType != NoCompression {
 		return errors.New("Unknown compression type")
+	}
+	if c.IsWitness && c.SnapshotEntries > 0 {
+		return errors.New("witness node can not take snapshot")
+	}
+	if c.IsWitness && c.IsObserver {
+		return errors.New("witness node can not be an observer")
 	}
 	return nil
 }
@@ -215,7 +254,8 @@ type NodeHostConfig struct {
 	// caused by NodeHost queuing and processing. As an example, when fully
 	// loaded, the average Rround Trip Time between two of our NodeHost instances
 	// used for benchmarking purposes is up to 500 microseconds when the ping time
-	// between them is 100 microseconds.
+	// between them is 100 microseconds. Set RTTMillisecond to 1 when it is less
+	// than 1 million in your environment.
 	RTTMillisecond uint64
 	// RaftAddress is a hostname:port or IP:port address used by the Raft RPC
 	// module for exchanging Raft messages and snapshots. This is also the
@@ -233,7 +273,7 @@ type NodeHostConfig struct {
 	// MutualTLS defines whether to use mutual TLS for authenticating servers
 	// and clients. Insecure communication is used when MutualTLS is set to
 	// False.
-	// See https://github.com/lni/dragonboat/v3/wiki/TLS-in-Dragonboat for more
+	// See https://github.com/lni/dragonboat/wiki/TLS-in-Dragonboat for more
 	// details on how to use Mutual TLS.
 	MutualTLS bool
 	// CAFile is the path of the CA certificate file. This field is ignored when
@@ -266,16 +306,55 @@ type NodeHostConfig struct {
 	// EnableMetrics determines whether health metrics in Prometheus format should
 	// be enabled.
 	EnableMetrics bool
-	// RaftEventListener is the listener for Raft events exposed to user space.
-	// NodeHost uses a single dedicated goroutine to invoke all RaftEventListener
-	// methods one by one, CPU intensive or IO related procedures that can cause
-	// long delays should be offloaded to worker goroutines managed by users.
+	// RaftEventListener is the listener for Raft events, such as Raft leadership
+	// change, exposed to user space. NodeHost uses a single dedicated goroutine
+	// to invoke all RaftEventListener methods one by one, CPU intensive or IO
+	// related procedures that can cause long delays should be offloaded to worker
+	// goroutines managed by users. See the raftio.IRaftEventListener definition
+	// for more details.
 	RaftEventListener raftio.IRaftEventListener
+	// MaxSnapshotSendBytesPerSecond defines how much snapshot data can be sent
+	// every second for all Raft clusters managed by the NodeHost instance.
+	// The default value 0 means there is no limit set for snapshot streaming.
+	MaxSnapshotSendBytesPerSecond uint64
+	// MaxSnapshotRecvBytesPerSecond defines how much snapshot data can be
+	// received each second for all Raft clusters managed by the NodeHost instance.
+	// The default value 0 means there is no limit for receiving snapshot data.
+	MaxSnapshotRecvBytesPerSecond uint64
+	// FS is the filesystem used by tests. Dragonboat applications are not
+	// required to explicitly set this field.
+	FS IFS
+	// SystemEventsListener allows users to be notified for system events such
+	// as snapshot creation, log compaction and snapshot streaming. It is usually
+	// used for testing purposes or for other advanced usages, Dragonboat
+	// applications are not required to explicitly set this field.
+	SystemEventListener raftio.ISystemEventListener
+	// SystemTickerPrecision is the precision of the system ticker. This value is
+	// usually set in tests. Dragonboat applications are not required to
+	// explicitly set this field.
+	SystemTickerPrecision time.Duration
+	// LogDBConfig is the configuration object for the LogDB storage engine. LogDB
+	// is used for storing Raft Logs and other metadata. This is an option for
+	// advanced users when tuning the balance of I/O performance and memory
+	// consumption. Regular users are recommdned not to set this field to use it
+	// default value.
+	LogDBConfig LogDBConfig
+	// NotifyCommit specifies whether clients should be notified when their
+	// regular proposals and config change requests are committed. By default,
+	// commits are not notified, clients are only notified when their proposals
+	// are both committed and applied.
+	NotifyCommit bool
 }
 
 // Validate validates the NodeHostConfig instance and return an error when
 // the configuration is considered as invalid.
 func (c *NodeHostConfig) Validate() error {
+	if c.RTTMillisecond == 0 {
+		return errors.New("invalid RTTMillisecond")
+	}
+	if len(c.NodeHostDir) == 0 {
+		return errors.New("NodeHostConfig.NodeHostDir is empty")
+	}
 	if !stringutil.IsValidAddress(c.RaftAddress) {
 		return errors.New("invalid NodeHost address")
 	}
@@ -304,6 +383,33 @@ func (c *NodeHostConfig) Validate() error {
 	if c.MaxReceiveQueueSize > 0 &&
 		c.MaxReceiveQueueSize < settings.EntryNonCmdFieldsSize+1 {
 		return errors.New("MaxReceiveSize value is too small")
+	}
+	return nil
+}
+
+// Prepare sets the default value for NodeHostConfig.
+func (c *NodeHostConfig) Prepare() error {
+	var err error
+	c.NodeHostDir, err = filepath.Abs(c.NodeHostDir)
+	if err != nil {
+		return err
+	}
+	if len(c.WALDir) > 0 {
+		c.WALDir, err = filepath.Abs(c.WALDir)
+		if err != nil {
+			return err
+		}
+	}
+	if c.FS == nil {
+		c.FS = vfs.DefaultFS
+	}
+	if c.SystemTickerPrecision == 0 {
+		plog.Infof("system ticker precision is set to 1ms (default)")
+		c.SystemTickerPrecision = time.Millisecond
+	}
+	if c.LogDBConfig.IsEmpty() {
+		plog.Infof("using default LogDBConfig")
+		c.LogDBConfig = GetDefaultLogDBConfig()
 	}
 	return nil
 }
@@ -348,7 +454,123 @@ func (c *NodeHostConfig) GetClientTLSConfig(target string) (*tls.Config, error) 
 	return nil, nil
 }
 
+// GetDeploymentID returns the deployment ID to be used.
+func (c *NodeHostConfig) GetDeploymentID() uint64 {
+	if c.DeploymentID == 0 {
+		return settings.UnmanagedDeploymentID
+	}
+	return c.DeploymentID
+}
+
 // IsValidAddress returns whether the input address is valid.
 func IsValidAddress(addr string) bool {
 	return stringutil.IsValidAddress(addr)
+}
+
+// LogDBConfig is the configuration object for the LogDB storage engine. This
+// config option is only for advanced users when tuning the balance of I/O
+// performance and memory consumption.
+//
+// All KV* fields in LogDBConfig had their names derived from RocksDB options,
+// please check RocksDB Tuning Guide wiki for more details.
+//
+// KVWriteBufferSize and KVMaxWriteBufferNumber are two parameters that directly
+// affect the upper bound of memory size used by the built-in LogDB storage
+// engine.
+type LogDBConfig struct {
+	KVKeepLogFileNum                   uint64
+	KVMaxBackgroundCompactions         uint64
+	KVMaxBackgroundFlushes             uint64
+	KVLRUCacheSize                     uint64
+	KVWriteBufferSize                  uint64
+	KVMaxWriteBufferNumber             uint64
+	KVLevel0FileNumCompactionTrigger   uint64
+	KVLevel0SlowdownWritesTrigger      uint64
+	KVLevel0StopWritesTrigger          uint64
+	KVMaxBytesForLevelBase             uint64
+	KVMaxBytesForLevelMultiplier       uint64
+	KVTargetFileSizeBase               uint64
+	KVTargetFileSizeMultiplier         uint64
+	KVLevelCompactionDynamicLevelBytes uint64
+	KVRecycleLogFileNum                uint64
+	KVNumOfLevels                      uint64
+	KVBlockSize                        uint64
+}
+
+// GetDefaultLogDBConfig returns the default configurations for the LogDB
+// storage engine. The default LogDB can use up to 8GBytes memory.
+func GetDefaultLogDBConfig() LogDBConfig {
+	return getDefaultLogDBConfig()
+}
+
+// GetTinyMemLogDBConfig returns a LogDB config aimed for minimizing memory
+// size. When using the returned config, LogDB takes up to 256MBytes memory.
+func GetTinyMemLogDBConfig() LogDBConfig {
+	cfg := getDefaultLogDBConfig()
+	cfg.KVWriteBufferSize = 4 * 1024 * 1024
+	cfg.KVMaxWriteBufferNumber = 4
+	return cfg
+}
+
+// GetSmallMemLogDBConfig returns a LogDB config aimed to keep memory size at
+// low level. When using the returned config, LogDB takes up to 1GBytes memory.
+func GetSmallMemLogDBConfig() LogDBConfig {
+	cfg := getDefaultLogDBConfig()
+	cfg.KVWriteBufferSize = 16 * 1024 * 1024
+	cfg.KVMaxWriteBufferNumber = 4
+	return cfg
+}
+
+// GetMediumMemLogDBConfig returns a LogDB config aimed to keep memory size at
+// medium level. When using the returned config, LogDB takes up to 4GBytes
+// memory.
+func GetMediumMemLogDBConfig() LogDBConfig {
+	cfg := getDefaultLogDBConfig()
+	cfg.KVWriteBufferSize = 64 * 1024 * 1024
+	cfg.KVMaxWriteBufferNumber = 4
+	return cfg
+}
+
+// GetLargeMemLogDBConfig returns a LogDB config aimed to keep memory size to be
+// large for good I/O performance. It is the default setting used by the system.
+// When using the returned config, LogDB takes up to 8GBytes memory.
+func GetLargeMemLogDBConfig() LogDBConfig {
+	return getDefaultLogDBConfig()
+}
+
+func getDefaultLogDBConfig() LogDBConfig {
+	return LogDBConfig{
+		KVMaxBackgroundCompactions:         2,
+		KVMaxBackgroundFlushes:             2,
+		KVLRUCacheSize:                     0,
+		KVKeepLogFileNum:                   16,
+		KVWriteBufferSize:                  128 * 1024 * 1024,
+		KVMaxWriteBufferNumber:             4,
+		KVLevel0FileNumCompactionTrigger:   8,
+		KVLevel0SlowdownWritesTrigger:      17,
+		KVLevel0StopWritesTrigger:          24,
+		KVMaxBytesForLevelBase:             4 * 1024 * 1024 * 1024,
+		KVMaxBytesForLevelMultiplier:       2,
+		KVTargetFileSizeBase:               16 * 1024 * 1024,
+		KVTargetFileSizeMultiplier:         2,
+		KVLevelCompactionDynamicLevelBytes: 0,
+		KVRecycleLogFileNum:                0,
+		KVNumOfLevels:                      7,
+		KVBlockSize:                        32 * 1024,
+	}
+}
+
+// MemorySizeMB returns the estimated upper bound memory size used by the LogDB
+// storage engine. The returned value is in MBytes.
+func (cfg *LogDBConfig) MemorySizeMB() uint64 {
+	ss := cfg.KVWriteBufferSize * cfg.KVMaxWriteBufferNumber
+	bs := ss * settings.Hard.LogDBPoolSize
+	return bs / (1024 * 1024)
+}
+
+// IsEmpty returns a boolean value indicating whether the LogDBConfig instance
+// is empty.
+func (cfg *LogDBConfig) IsEmpty() bool {
+	empty := LogDBConfig{}
+	return reflect.DeepEqual(cfg, &empty)
 }

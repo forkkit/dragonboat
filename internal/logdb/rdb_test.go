@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,78 +16,99 @@ package logdb
 
 import (
 	"math"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/lni/goutils/leaktest"
+
+	"github.com/lni/dragonboat/v3/config"
+	"github.com/lni/dragonboat/v3/internal/fileutil"
+	"github.com/lni/dragonboat/v3/internal/vfs"
 	"github.com/lni/dragonboat/v3/raftio"
 	pb "github.com/lni/dragonboat/v3/raftpb"
-	"github.com/lni/goutils/leaktest"
 )
 
 const (
 	RDBTestDirectory = "rdb_test_dir_safe_to_delete"
 )
 
-func getDirSize(path string) (int64, error) {
+func getDirSize(path string, includeLogSize bool, fs vfs.IFS) (int64, error) {
 	var size int64
-	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
-		if err == nil && !info.IsDir() {
+	results, err := fs.List(path)
+	if err != nil {
+		return 0, err
+	}
+	for _, v := range results {
+		info, err := fs.Stat(fs.PathJoin(path, v))
+		if err != nil {
+			return 0, err
+		}
+		if !info.IsDir() {
+			if !includeLogSize && strings.HasSuffix(info.Name(), ".log") {
+				continue
+			}
 			size += info.Size()
 		}
-		return nil
-	})
+	}
 	return size, err
 }
 
-func getNewTestDB(dir string, lldir string, batched bool) raftio.ILogDB {
-	d := filepath.Join(RDBTestDirectory, dir)
-	lld := filepath.Join(RDBTestDirectory, lldir)
-	if err := os.MkdirAll(d, 0777); err != nil {
+func getNewTestDB(dir string, lldir string, batched bool, fs vfs.IFS) raftio.ILogDB {
+	d := fs.PathJoin(RDBTestDirectory, dir)
+	lld := fs.PathJoin(RDBTestDirectory, lldir)
+	if err := fileutil.MkdirAll(d, fs); err != nil {
 		panic(err)
 	}
-	if err := os.MkdirAll(lld, 0777); err != nil {
+	if err := fileutil.MkdirAll(lld, fs); err != nil {
 		panic(err)
 	}
-	db, err := NewLogDB([]string{d}, []string{lld}, batched, false, newDefaultKVStore)
+	cfg := config.GetDefaultLogDBConfig()
+	db, err := NewLogDB(cfg,
+		[]string{d}, []string{lld}, batched, false, fs, newDefaultKVStore)
 	if err != nil {
 		panic(err)
 	}
 	return db
 }
 
-func deleteTestDB() {
-	os.RemoveAll(RDBTestDirectory)
+func deleteTestDB(fs vfs.IFS) {
+	if err := fs.RemoveAll(RDBTestDirectory); err != nil {
+		panic(err)
+	}
 }
 
 func runLogDBTestAs(t *testing.T,
-	batched bool, tf func(t *testing.T, db raftio.ILogDB)) {
+	batched bool, tf func(t *testing.T, db raftio.ILogDB), fs vfs.IFS) {
 	defer leaktest.AfterTest(t)()
 	dir := "db-dir"
 	lldir := "wal-db-dir"
-	d := filepath.Join(RDBTestDirectory, dir)
-	lld := filepath.Join(RDBTestDirectory, lldir)
-	os.RemoveAll(d)
-	os.RemoveAll(lld)
-	db := getNewTestDB(dir, lldir, batched)
-	defer deleteTestDB()
+	d := fs.PathJoin(RDBTestDirectory, dir)
+	lld := fs.PathJoin(RDBTestDirectory, lldir)
+	if err := fs.RemoveAll(d); err != nil {
+		t.Fatalf("%v", err)
+	}
+	if err := fs.RemoveAll(lld); err != nil {
+		t.Fatalf("%v", err)
+	}
+	db := getNewTestDB(dir, lldir, batched, fs)
+	defer deleteTestDB(fs)
 	defer db.Close()
 	tf(t, db)
 }
 
-func runLogDBTest(t *testing.T, tf func(t *testing.T, db raftio.ILogDB)) {
-	runLogDBTestAs(t, false, tf)
-	runLogDBTestAs(t, true, tf)
+func runLogDBTest(t *testing.T, tf func(t *testing.T, db raftio.ILogDB), fs vfs.IFS) {
+	runLogDBTestAs(t, false, tf, fs)
+	runLogDBTestAs(t, true, tf, fs)
 }
 
-func runBatchedLogDBTest(t *testing.T, tf func(t *testing.T, db raftio.ILogDB)) {
-	runLogDBTestAs(t, true, tf)
+func runBatchedLogDBTest(t *testing.T, tf func(t *testing.T, db raftio.ILogDB), fs vfs.IFS) {
+	runLogDBTestAs(t, true, tf, fs)
 }
 
 func TestRDBReturnErrNoBootstrapInfoWhenNoBootstrap(t *testing.T) {
+	fs := vfs.GetTestFS()
 	tf := func(t *testing.T, db raftio.ILogDB) {
 		bootstrap, err := db.GetBootstrapInfo(1, 2)
 		if err != raftio.ErrNoBootstrapInfo {
@@ -97,7 +118,7 @@ func TestRDBReturnErrNoBootstrapInfoWhenNoBootstrap(t *testing.T) {
 			t.Errorf("not nil value")
 		}
 	}
-	runLogDBTest(t, tf)
+	runLogDBTest(t, tf, fs)
 }
 
 func TestBootstrapInfoCanBeSavedAndChecked(t *testing.T) {
@@ -147,7 +168,8 @@ func TestBootstrapInfoCanBeSavedAndChecked(t *testing.T) {
 			t.Errorf("failed to get node info list")
 		}
 	}
-	runLogDBTest(t, tf)
+	fs := vfs.GetTestFS()
+	runLogDBTest(t, tf, fs)
 }
 
 func TestSnapshotHasMaxIndexSet(t *testing.T) {
@@ -162,7 +184,7 @@ func TestSnapshotHasMaxIndexSet(t *testing.T) {
 			t.Fatalf("failed to save raft state %v", err)
 		}
 		p := db.(*ShardedRDB).shards
-		maxIndex, err := p[3].readMaxIndex(3, 4)
+		maxIndex, err := p[3].getMaxIndex(3, 4)
 		if err != nil {
 			t.Errorf("%v", err)
 		}
@@ -178,7 +200,7 @@ func TestSnapshotHasMaxIndexSet(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to save raft state %v", err)
 		}
-		maxIndex, err = p[3].readMaxIndex(3, 4)
+		maxIndex, err = p[3].getMaxIndex(3, 4)
 		if err != nil {
 			t.Errorf("%v", err)
 		}
@@ -186,7 +208,8 @@ func TestSnapshotHasMaxIndexSet(t *testing.T) {
 			t.Errorf("max index %d, want 3", maxIndex)
 		}
 	}
-	runLogDBTest(t, tf)
+	fs := vfs.GetTestFS()
+	runLogDBTest(t, tf, fs)
 }
 
 func TestSaveSnapshotTogetherWithUnexpectedEntriesWillPanic(t *testing.T) {
@@ -207,7 +230,8 @@ func TestSaveSnapshotTogetherWithUnexpectedEntriesWillPanic(t *testing.T) {
 			t.Errorf("panic not triggered")
 		}
 	}()
-	runLogDBTest(t, tf)
+	fs := vfs.GetTestFS()
+	runLogDBTest(t, tf, fs)
 }
 
 func TestSnapshotsSavedInSaveRaftState(t *testing.T) {
@@ -280,14 +304,14 @@ func TestSnapshotsSavedInSaveRaftState(t *testing.T) {
 			t.Errorf("snapshot index %d, want %d", v[0].Index, snapshot2.Index)
 		}
 		p := db.(*ShardedRDB).shards
-		maxIndex, err := p[3].readMaxIndex(3, 3)
+		maxIndex, err := p[3].getMaxIndex(3, 3)
 		if err != nil {
 			t.Errorf("%v", err)
 		}
 		if maxIndex != 20 {
 			t.Errorf("max index %d, want 20", maxIndex)
 		}
-		maxIndex, err = p[3].readMaxIndex(3, 4)
+		maxIndex, err = p[3].getMaxIndex(3, 4)
 		if err != nil {
 			t.Errorf("%v", err)
 		}
@@ -295,7 +319,8 @@ func TestSnapshotsSavedInSaveRaftState(t *testing.T) {
 			t.Errorf("max index %d, want 10", maxIndex)
 		}
 	}
-	runLogDBTest(t, tf)
+	fs := vfs.GetTestFS()
+	runLogDBTest(t, tf, fs)
 }
 
 func TestSnapshotOnlyNodeIsHandledByReadRaftState(t *testing.T) {
@@ -326,7 +351,8 @@ func TestSnapshotOnlyNodeIsHandledByReadRaftState(t *testing.T) {
 			t.Errorf("unexpected rs %+v", rs)
 		}
 	}
-	runLogDBTest(t, tf)
+	fs := vfs.GetTestFS()
+	runLogDBTest(t, tf, fs)
 }
 
 func TestReadRaftStateReturnsNoSavedLogErrorWhenStateIsNeverSaved(t *testing.T) {
@@ -348,7 +374,8 @@ func TestReadRaftStateReturnsNoSavedLogErrorWhenStateIsNeverSaved(t *testing.T) 
 			t.Fatalf("failed to return expected error %v", err)
 		}
 	}
-	runLogDBTest(t, tf)
+	fs := vfs.GetTestFS()
+	runLogDBTest(t, tf, fs)
 }
 
 func TestMaxIndexRuleIsEnforced(t *testing.T) {
@@ -402,7 +429,8 @@ func TestMaxIndexRuleIsEnforced(t *testing.T) {
 			t.Errorf("entry index %d, want 3", rs.FirstIndex)
 		}
 	}
-	runLogDBTest(t, tf)
+	fs := vfs.GetTestFS()
+	runLogDBTest(t, tf, fs)
 }
 
 func TestSavedEntrieseAreOrderedByTheKey(t *testing.T) {
@@ -454,7 +482,8 @@ func TestSavedEntrieseAreOrderedByTheKey(t *testing.T) {
 			lastIndex = e.Index
 		}
 	}
-	runLogDBTest(t, tf)
+	fs := vfs.GetTestFS()
+	runLogDBTest(t, tf, fs)
 }
 
 func testSaveRaftState(t *testing.T, db raftio.ILogDB) {
@@ -506,7 +535,8 @@ func TestSaveRaftState(t *testing.T) {
 	tf := func(t *testing.T, db raftio.ILogDB) {
 		testSaveRaftState(t, db)
 	}
-	runLogDBTest(t, tf)
+	fs := vfs.GetTestFS()
+	runLogDBTest(t, tf, fs)
 }
 
 func TestStateIsUpdated(t *testing.T) {
@@ -560,7 +590,8 @@ func TestStateIsUpdated(t *testing.T) {
 			t.Errorf("unexpected persistent state value %v", rs)
 		}
 	}
-	runLogDBTest(t, tf)
+	fs := vfs.GetTestFS()
+	runLogDBTest(t, tf, fs)
 }
 
 func TestMaxIndexIsUpdated(t *testing.T) {
@@ -587,7 +618,7 @@ func TestMaxIndexIsUpdated(t *testing.T) {
 			t.Errorf("failed to save single de rec")
 		}
 		p := db.(*ShardedRDB).shards
-		maxIndex, err := p[3].readMaxIndex(3, 4)
+		maxIndex, err := p[3].getMaxIndex(3, 4)
 		if err != nil {
 			t.Errorf("%v", err)
 		}
@@ -610,7 +641,7 @@ func TestMaxIndexIsUpdated(t *testing.T) {
 		if err != nil {
 			t.Errorf("failed to save single de rec")
 		}
-		maxIndex, err = p[3].readMaxIndex(3, 4)
+		maxIndex, err = p[3].getMaxIndex(3, 4)
 		if err != nil {
 			t.Errorf("%v", err)
 		}
@@ -618,7 +649,8 @@ func TestMaxIndexIsUpdated(t *testing.T) {
 			t.Errorf("max index %d, want 11", maxIndex)
 		}
 	}
-	runLogDBTest(t, tf)
+	fs := vfs.GetTestFS()
+	runLogDBTest(t, tf, fs)
 }
 
 func TestReadAllEntriesOnlyReturnEntriesFromTheSpecifiedNode(t *testing.T) {
@@ -685,7 +717,8 @@ func TestReadAllEntriesOnlyReturnEntriesFromTheSpecifiedNode(t *testing.T) {
 			t.Errorf("ents sz %d, want 2", rs.EntryCount)
 		}
 	}
-	runLogDBTest(t, tf)
+	fs := vfs.GetTestFS()
+	runLogDBTest(t, tf, fs)
 }
 
 func TestIterateEntriesOnlyReturnCurrentNodeEntries(t *testing.T) {
@@ -749,7 +782,8 @@ func TestIterateEntriesOnlyReturnCurrentNodeEntries(t *testing.T) {
 			t.Errorf("ents sz %d, want 3", len(ents))
 		}
 	}
-	runLogDBTest(t, tf)
+	fs := vfs.GetTestFS()
+	runLogDBTest(t, tf, fs)
 }
 
 func TestIterateEntries(t *testing.T) {
@@ -835,7 +869,18 @@ func TestIterateEntries(t *testing.T) {
 			}
 		}
 	}
-	runLogDBTest(t, tf)
+	fs := vfs.GetTestFS()
+	runLogDBTest(t, tf, fs)
+}
+
+func TestDeleteNotExistSnapshotIsAllowed(t *testing.T) {
+	tf := func(t *testing.T, db raftio.ILogDB) {
+		if err := db.DeleteSnapshot(1, 2, 1); err != nil {
+			t.Errorf("delete snapshot failed %v", err)
+		}
+	}
+	fs := vfs.GetTestFS()
+	runLogDBTest(t, tf, fs)
 }
 
 func TestSaveSnapshot(t *testing.T) {
@@ -900,7 +945,8 @@ func TestSaveSnapshot(t *testing.T) {
 			t.Errorf("unexpected snapshot returned")
 		}
 	}
-	runLogDBTest(t, tf)
+	fs := vfs.GetTestFS()
+	runLogDBTest(t, tf, fs)
 }
 
 func TestParseNodeInfoKeyPanicOnUnexpectedKeySize(t *testing.T) {
@@ -986,7 +1032,8 @@ func TestSaveEntriesWithIndexGap(t *testing.T) {
 			t.Errorf("unexpected index")
 		}
 	}
-	runLogDBTest(t, tf)
+	fs := vfs.GetTestFS()
+	runLogDBTest(t, tf, fs)
 }
 
 func testAllWantedEntriesAreAccessible(t *testing.T, first uint64, last uint64) {
@@ -1039,25 +1086,35 @@ func testAllWantedEntriesAreAccessible(t *testing.T, first uint64, last uint64) 
 			t.Errorf("length %d, want %d", length, last-first+1)
 		}
 	}
-	runLogDBTest(t, tf)
+	fs := vfs.GetTestFS()
+	runLogDBTest(t, tf, fs)
 }
 
 func TestRemoveEntriesTo(t *testing.T) {
+	fs := vfs.GetTestFS()
 	defer leaktest.AfterTest(t)()
 	dir := "db-dir"
 	lldir := "wal-db-dir"
-	d := filepath.Join(RDBTestDirectory, dir)
-	lld := filepath.Join(RDBTestDirectory, lldir)
-	os.RemoveAll(d)
-	os.RemoveAll(lld)
-	defer os.RemoveAll(RDBTestDirectory)
+	d := fs.PathJoin(RDBTestDirectory, dir)
+	lld := fs.PathJoin(RDBTestDirectory, lldir)
+	if err := fs.RemoveAll(d); err != nil {
+		t.Fatalf("%v", err)
+	}
+	if err := fs.RemoveAll(lld); err != nil {
+		t.Fatalf("%v", err)
+	}
+	defer func() {
+		if err := fs.RemoveAll(RDBTestDirectory); err != nil {
+			t.Fatalf("%v", err)
+		}
+	}()
 	clusterID := uint64(0)
 	nodeID := uint64(4)
 	ents := make([]pb.Entry, 0)
 	maxIndex := uint64(1024)
 	skipSizeCheck := false
 	func() {
-		db := getNewTestDB(dir, lldir, false)
+		db := getNewTestDB(dir, lldir, false, fs)
 		sdb, ok := db.(*ShardedRDB)
 		if !ok {
 			t.Fatalf("failed to get sdb")
@@ -1090,17 +1147,28 @@ func TestRemoveEntriesTo(t *testing.T) {
 			t.Fatalf("failed to save recs")
 		}
 		if err := db.RemoveEntriesTo(clusterID, nodeID, maxIndex); err != nil {
-			t.Fatalf("failed to remove entries to, %v", err)
+			t.Fatalf("failed to remove entries, %v", err)
+		}
+		done, err := db.CompactEntriesTo(clusterID, nodeID, maxIndex)
+		if err != nil {
+			t.Fatalf("failed to compact entries to, %v", err)
 		}
 		for i := 0; i < 1000; i++ {
-			if atomic.LoadUint64(&(sdb.completedCompactions)) == 0 {
+			count := atomic.LoadUint64(&(sdb.completedCompactions))
+			if count == 0 {
 				time.Sleep(10 * time.Millisecond)
 			} else {
+				plog.Infof("count: %d, done", count)
 				break
 			}
 			if i == 999 {
 				t.Fatalf("failed to trigger compaction")
 			}
+		}
+		select {
+		case <-done:
+		default:
+			t.Fatalf("done chan not closed")
 		}
 		results, _, err := db.IterateEntries(nil,
 			0, clusterID, nodeID, 1, 100, math.MaxUint64)
@@ -1108,14 +1176,14 @@ func TestRemoveEntriesTo(t *testing.T) {
 			t.Errorf("iterate entries failed %v", err)
 		}
 		if len(results) > 0 {
-			t.Errorf("entries not deleted")
+			t.Errorf("entries not deleted, %d", len(results))
 		}
 	}()
 	// leveldb has the leftover ldb file
 	// https://github.com/google/leveldb/issues/573
 	// https://github.com/google/leveldb/issues/593
 	if !skipSizeCheck {
-		sz, err := getDirSize(RDBTestDirectory)
+		sz, err := getDirSize(RDBTestDirectory, false, fs)
 		if err != nil {
 			t.Fatalf("failed to get sz %v", err)
 		}
@@ -1209,7 +1277,8 @@ func TestReadRaftStateWithSnapshot(t *testing.T) {
 				t.Errorf("unexpected range %d:%d", fi, li)
 			}
 		}
-		runLogDBTest(t, tf)
+		fs := vfs.GetTestFS()
+		runLogDBTest(t, tf, fs)
 	}
 }
 
@@ -1252,7 +1321,8 @@ func TestReadRaftStateWithEntriesOnly(t *testing.T) {
 			t.Errorf("length %d, want %d", state.EntryCount, batchSize*3+1)
 		}
 	}
-	runLogDBTest(t, tf)
+	fs := vfs.GetTestFS()
+	runLogDBTest(t, tf, fs)
 }
 
 func TestRemoveNodeData(t *testing.T) {
@@ -1331,7 +1401,8 @@ func TestRemoveNodeData(t *testing.T) {
 			t.Fatalf("entry returned")
 		}
 	}
-	runLogDBTest(t, tf)
+	fs := vfs.GetTestFS()
+	runLogDBTest(t, tf, fs)
 }
 
 func TestImportSnapshot(t *testing.T) {
@@ -1407,7 +1478,7 @@ func TestImportSnapshot(t *testing.T) {
 		}
 		rdb := db.(*ShardedRDB).shards[2]
 		rdb.cs.maxIndex = make(map[raftio.NodeInfo]uint64)
-		maxIndex, err := rdb.readMaxIndex(clusterID, nodeID)
+		maxIndex, err := rdb.getMaxIndex(clusterID, nodeID)
 		if err != nil {
 			t.Errorf("failed to get max index")
 		}
@@ -1428,5 +1499,6 @@ func TestImportSnapshot(t *testing.T) {
 			t.Errorf("unexpected entry count %d", state.EntryCount)
 		}
 	}
-	runLogDBTest(t, tf)
+	fs := vfs.GetTestFS()
+	runLogDBTest(t, tf, fs)
 }

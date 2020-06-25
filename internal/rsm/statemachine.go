@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
+// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other Dragonboat authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,18 +23,19 @@ package rsm
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"sync"
+
+	"github.com/lni/goutils/logutil"
 
 	"github.com/lni/dragonboat/v3/config"
 	"github.com/lni/dragonboat/v3/internal/raft"
 	"github.com/lni/dragonboat/v3/internal/server"
 	"github.com/lni/dragonboat/v3/internal/settings"
 	"github.com/lni/dragonboat/v3/internal/tests"
+	"github.com/lni/dragonboat/v3/internal/vfs"
 	"github.com/lni/dragonboat/v3/logger"
 	pb "github.com/lni/dragonboat/v3/raftpb"
 	sm "github.com/lni/dragonboat/v3/statemachine"
-	"github.com/lni/goutils/logutil"
 )
 
 var (
@@ -45,12 +46,10 @@ var (
 	// ErrTestKnobReturn is the error returned when returned earlier due to test
 	// knob.
 	ErrTestKnobReturn = errors.New("returned earlier due to test knob")
-	// ErrSaveSnapshot indicates there is error when trying to save a snapshot
-	ErrSaveSnapshot = errors.New("failed to save snapshot")
 	// ErrRestoreSnapshot indicates there is error when trying to restore
 	// from a snapshot
 	ErrRestoreSnapshot             = errors.New("failed to restore from snapshot")
-	batchedEntryApply       bool   = settings.Soft.BatchedEntryApply
+	batchedEntryApply              = settings.Soft.BatchedEntryApply
 	sessionBufferInitialCap uint64 = 128 * 1024
 )
 
@@ -58,14 +57,14 @@ var (
 type SSReqType uint64
 
 const (
-	// PeriodicSnapshot is the value to indicate periodic snapshot.
-	PeriodicSnapshot SSReqType = iota
-	// UserRequestedSnapshot is the value to indicate user requested snapshot.
-	UserRequestedSnapshot
-	// ExportedSnapshot is the value to indicate exported snapshot.
-	ExportedSnapshot
-	// StreamSnapshot is the value to indicate snapshot streaming.
-	StreamSnapshot
+	// Periodic is the value to indicate periodic snapshot.
+	Periodic SSReqType = iota
+	// UserRequested is the value to indicate user requested snapshot.
+	UserRequested
+	// Exported is the value to indicate exported snapshot.
+	Exported
+	// Streaming is the value to indicate snapshot streaming.
+	Streaming
 )
 
 // SSRequest is the type for describing the details of a snapshot request.
@@ -77,16 +76,16 @@ type SSRequest struct {
 	CompactionOverhead uint64
 }
 
-// IsExportedSnapshot returns a boolean value indicating whether the snapshot
-// request is to create an exported snapshot.
-func (r *SSRequest) IsExportedSnapshot() bool {
-	return r.Type == ExportedSnapshot
+// Exported returns a boolean value indicating whether the snapshot request
+// is to create an exported snapshot.
+func (r *SSRequest) Exported() bool {
+	return r.Type == Exported
 }
 
-// IsStreamingSnapshot returns a boolean value indicating whether the snapshot
-// request is to stream snapshot.
-func (r *SSRequest) IsStreamingSnapshot() bool {
-	return r.Type == StreamSnapshot
+// Streaming returns a boolean value indicating whether the snapshot request
+// is to stream snapshot.
+func (r *SSRequest) Streaming() bool {
+	return r.Type == Streaming
 }
 
 // SSMeta is the metadata of a snapshot.
@@ -135,9 +134,9 @@ func (t *Task) isSyncTask() bool {
 type SMFactoryFunc func(clusterID uint64,
 	nodeID uint64, done <-chan struct{}) IManagedStateMachine
 
-// INodeProxy is the interface used as proxy to a nodehost.
-type INodeProxy interface {
-	NodeReady()
+// INode is the interface of a dragonboat node.
+type INode interface {
+	StepReady()
 	RestoreRemotes(pb.Snapshot)
 	ApplyUpdate(pb.Entry, sm.Result, bool, bool, bool)
 	ApplyConfigChange(pb.ConfigChange)
@@ -154,7 +153,7 @@ type ISnapshotter interface {
 	GetFilePath(uint64) string
 	Stream(IStreamable, *SSMeta, pb.IChunkSink) error
 	Save(ISavable, *SSMeta) (*pb.Snapshot, *server.SSEnv, error)
-	Load(ILoadableSessions, ILoadableSM, string, []sm.SnapshotFile) error
+	Load(ILoadable, IRecoverable, string, []sm.SnapshotFile) error
 	IsNoSnapshotError(error) bool
 }
 
@@ -163,7 +162,7 @@ type ISnapshotter interface {
 type StateMachine struct {
 	mu              sync.RWMutex
 	snapshotter     ISnapshotter
-	node            INodeProxy
+	node            INode
 	sm              IManagedStateMachine
 	sessions        *SessionManager
 	members         *membership
@@ -175,7 +174,9 @@ type StateMachine struct {
 	taskQ           *TaskQueue
 	onDiskSM        bool
 	aborted         bool
+	isWitness       bool
 	sct             config.CompressionType
+	fs              vfs.IFS
 	syncedIndex     struct {
 		sync.Mutex
 		index uint64
@@ -188,20 +189,21 @@ type StateMachine struct {
 
 // NewStateMachine creates a new application state machine object.
 func NewStateMachine(sm IManagedStateMachine,
-	snapshotter ISnapshotter, cfg config.Config, proxy INodeProxy) *StateMachine {
+	snapshotter ISnapshotter,
+	cfg config.Config, node INode, fs vfs.IFS) *StateMachine {
 	ordered := cfg.OrderedConfigChange
-	ct := cfg.SnapshotCompressionType
-	a := &StateMachine{
+	return &StateMachine{
 		snapshotter: snapshotter,
 		sm:          sm,
-		onDiskSM:    sm.OnDiskStateMachine(),
+		onDiskSM:    sm.OnDisk(),
 		taskQ:       NewTaskQueue(),
-		node:        proxy,
+		node:        node,
 		sessions:    NewSessionManager(),
-		members:     newMembership(proxy.ClusterID(), proxy.NodeID(), ordered),
-		sct:         ct,
+		members:     newMembership(node.ClusterID(), node.NodeID(), ordered),
+		isWitness:   cfg.IsWitness,
+		sct:         cfg.SnapshotCompressionType,
+		fs:          fs,
 	}
-	return a
 }
 
 // TaskQ returns the task queue.
@@ -216,8 +218,14 @@ func (s *StateMachine) TaskChanBusy() bool {
 	return sz*2 > taskQueueBusyCap
 }
 
-// RecoverFromSnapshot applies the snapshot.
-func (s *StateMachine) RecoverFromSnapshot(t Task) (uint64, error) {
+// DestroyedC return a chan struct{} used to indicate whether the SM has been
+// fully unloaded.
+func (s *StateMachine) DestroyedC() <-chan struct{} {
+	return s.sm.DestroyedC()
+}
+
+// Recover applies the snapshot.
+func (s *StateMachine) Recover(t Task) (uint64, error) {
 	ss, err := s.getSnapshot(t)
 	if err != nil {
 		return 0, err
@@ -225,16 +233,15 @@ func (s *StateMachine) RecoverFromSnapshot(t Task) (uint64, error) {
 	if pb.IsEmptySnapshot(ss) {
 		return 0, nil
 	}
-	ss.Validate()
-	plog.Infof("%s called RecoverFromSnapshot, idx %d, on disk idx %d",
-		s.id(), ss.Index, ss.OnDiskIndex)
-	if idx, err := s.recoverFromSnapshot(ss, t.InitialSnapshot); err != nil {
-		return idx, err
+	ss.Validate(s.fs)
+	plog.Infof("%s called RecoverFromSnapshot, %s, on disk idx %d",
+		s.id(), s.ssid(ss.Index), ss.OnDiskIndex)
+	if err := s.recover(ss, t.InitialSnapshot); err != nil {
+		return 0, err
 	}
 	s.node.RestoreRemotes(ss)
 	s.setBatchedLastApplied(ss.Index)
-	plog.Infof("%s snapshot %d restored, members %v",
-		s.id(), ss.Index, ss.Membership.Addresses)
+	plog.Infof("%s restored %s", s.id(), s.ssid(ss.Index))
 	return ss.Index, nil
 }
 
@@ -253,23 +260,22 @@ func (s *StateMachine) getSnapshot(t Task) (pb.Snapshot, error) {
 	}
 	snapshot, err := s.snapshotter.GetMostRecentSnapshot()
 	if s.snapshotter.IsNoSnapshotError(err) {
-		plog.Infof("%s no snapshot available during node launch", s.id())
+		plog.Infof("%s no snapshot available during launch", s.id())
 		return pb.Snapshot{}, nil
 	}
 	return snapshot, nil
 }
 
-func (s *StateMachine) recoverSMRequired(ss pb.Snapshot, init bool) bool {
+func (s *StateMachine) mustBeOnDiskSM() {
 	if !s.OnDiskStateMachine() {
-		return true
+		panic("not an on disk sm")
 	}
-	if ss.Dummy {
-		return false
-	}
-	// just a self test to see whether it is trying to recover from a shrunk
-	// snapshot
+}
+
+func (s *StateMachine) recoverSMRequired(ss pb.Snapshot, init bool) bool {
+	s.mustBeOnDiskSM()
 	fn := s.snapshotter.GetFilePath(ss.Index)
-	shrunk, err := IsShrinkedSnapshotFile(fn)
+	shrunk, err := IsShrinkedSnapshotFile(fn, s.fs)
 	if err != nil {
 		panic(err)
 	}
@@ -288,47 +294,8 @@ func (s *StateMachine) recoverSMRequired(ss pb.Snapshot, init bool) bool {
 	return ss.OnDiskIndex > s.onDiskIndex
 }
 
-func (s *StateMachine) recoverFromSnapshot(ss pb.Snapshot,
-	init bool) (uint64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	index := ss.Index
-	if s.index >= index {
-		return s.index, raft.ErrSnapshotOutOfDate
-	}
-	if s.aborted {
-		return 0, sm.ErrSnapshotStopped
-	}
-	if s.recoverSMRequired(ss, init) {
-		plog.Infof("%s recovering from snapshot, term %d, index %d, %s, init %t",
-			s.id(), ss.Term, index, snapshotInfo(ss), init)
-		fs := getSnapshotFiles(ss)
-		fn := s.snapshotter.GetFilePath(index)
-		s.canRecoverOnDiskSnapshot(ss, init)
-		if err := s.snapshotter.Load(s.sessions, s.sm, fn, fs); err != nil {
-			plog.Errorf("failed to load snapshot, %s, %v", s.id(), err)
-			if err == sm.ErrSnapshotStopped {
-				// no more lookup allowed
-				s.aborted = true
-				return 0, err
-			}
-			return 0, ErrRestoreSnapshot
-		}
-		s.recoverFromOnDiskSnapshot(ss, init)
-	} else {
-		plog.Infof("%s is on disk SM, %d vs %d, SM not restored",
-			s.id(), index, s.onDiskInitIndex)
-	}
-	s.index = index
-	s.term = ss.Term
-	s.members.set(ss.Membership)
-	return 0, nil
-}
-
 func (s *StateMachine) canRecoverOnDiskSnapshot(ss pb.Snapshot, init bool) {
-	if !s.OnDiskStateMachine() {
-		return
-	}
+	s.mustBeOnDiskSM()
 	if ss.Imported && init {
 		return
 	}
@@ -342,33 +309,109 @@ func (s *StateMachine) canRecoverOnDiskSnapshot(ss pb.Snapshot, init bool) {
 	}
 }
 
-func (s *StateMachine) recoverFromOnDiskSnapshot(ss pb.Snapshot, init bool) {
-	if !s.OnDiskStateMachine() {
-		return
+func (s *StateMachine) recover(ss pb.Snapshot, init bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	index := ss.Index
+	if s.index >= index {
+		return raft.ErrSnapshotOutOfDate
 	}
+	if s.aborted {
+		return sm.ErrSnapshotStopped
+	}
+	if ss.Witness || ss.Dummy {
+		s.apply(ss)
+		return nil
+	}
+	if !s.OnDiskStateMachine() {
+		return s.doRecover(ss, init)
+	}
+	if s.recoverSMRequired(ss, init) {
+		s.canRecoverOnDiskSnapshot(ss, init)
+		if err := s.doRecover(ss, init); err != nil {
+			return err
+		}
+		s.applyOnDisk(ss, init)
+	} else {
+		plog.Infof("%s is on disk SM, %d vs %d, SM not restored",
+			s.id(), index, s.onDiskInitIndex)
+		s.apply(ss)
+	}
+	return nil
+}
+
+func (s *StateMachine) doRecover(ss pb.Snapshot, init bool) error {
+	index := ss.Index
+	plog.Infof("%s recovering from %s, init %t", s.id(), s.ssid(index), init)
+	s.logMembership("members", index, ss.Membership.Addresses)
+	s.logMembership("observers", index, ss.Membership.Observers)
+	s.logMembership("witnesses", index, ss.Membership.Witnesses)
+	fs := make([]sm.SnapshotFile, 0)
+	for _, f := range ss.Files {
+		f := sm.SnapshotFile{
+			FileID:   f.FileId,
+			Filepath: f.Filepath,
+			Metadata: f.Metadata,
+		}
+		fs = append(fs, f)
+	}
+	fn := s.snapshotter.GetFilePath(index)
+	if err := s.snapshotter.Load(s.sessions, s.sm, fn, fs); err != nil {
+		plog.Errorf("%s failed to load %s, %v", s.id(), s.ssid(index), err)
+		if err == sm.ErrSnapshotStopped {
+			s.aborted = true
+			return err
+		}
+		return ErrRestoreSnapshot
+	}
+	s.apply(ss)
+	return nil
+}
+
+func (s *StateMachine) apply(ss pb.Snapshot) {
+	s.index = ss.Index
+	s.term = ss.Term
+	s.members.set(ss.Membership)
+}
+
+func (s *StateMachine) applyOnDisk(ss pb.Snapshot, init bool) {
+	s.mustBeOnDiskSM()
 	s.onDiskIndex = ss.OnDiskIndex
 	if ss.Imported && init {
 		s.onDiskInitIndex = ss.OnDiskIndex
 	}
+	s.apply(ss)
 }
 
 //TODO: add test to cover the case when ReadyToStreamSnapshot returns false
 
-// ReadyToStreamSnapshot returns a boolean flag to indicate whether the state
-// machine is ready to stream snasphot. It can not stream a full snapshot when
+// ReadyToStream returns a boolean flag to indicate whether the state machine
+// is ready to stream snapshot. It can not stream a full snapshot when
 // membership state is catching up with the all disk SM state. however, meta
 // only snapshot can be taken at any time.
-func (s *StateMachine) ReadyToStreamSnapshot() bool {
+func (s *StateMachine) ReadyToStream() bool {
 	if !s.OnDiskStateMachine() {
 		return true
 	}
 	return s.GetLastApplied() >= s.onDiskInitIndex
 }
 
+func (s *StateMachine) tryInjectTestFS() {
+	nsm, ok := s.sm.(*NativeSM)
+	if ok {
+		odsm, ok := nsm.sm.(*OnDiskStateMachine)
+		if ok {
+			odsm.SetTestFS(s.fs)
+		}
+	}
+}
+
 // OpenOnDiskStateMachine opens the on disk state machine.
 func (s *StateMachine) OpenOnDiskStateMachine() (uint64, error) {
+	s.mustBeOnDiskSM()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.tryInjectTestFS()
 	index, err := s.sm.Open()
 	if err != nil {
 		plog.Errorf("%s failed to open on disk SM", s.id())
@@ -428,12 +471,14 @@ func (s *StateMachine) setBatchedLastApplied(index uint64) {
 	s.batchedIndex.Unlock()
 }
 
-// Offloaded marks the state machine as offloaded from the specified component.
-func (s *StateMachine) Offloaded(from From) {
-	s.sm.Offloaded(from)
+// Offloaded marks the state machine as offloaded from the specified compone.
+// It returns a boolean value indicating whether the node has been fully
+// unloaded after unloading from the specified compone.
+func (s *StateMachine) Offloaded(from From) bool {
+	return s.sm.Offloaded(from)
 }
 
-// Loaded marks the state machine as loaded from the specified component.
+// Loaded marks the state machine as loaded from the specified compone.
 func (s *StateMachine) Loaded(from From) {
 	s.sm.Loaded(from)
 }
@@ -485,8 +530,7 @@ func (s *StateMachine) naConcurrentLookup(query []byte) ([]byte, error) {
 }
 
 // GetMembership returns the membership info maintained by the state machine.
-func (s *StateMachine) GetMembership() (map[uint64]string,
-	map[uint64]string, map[uint64]struct{}, uint64) {
+func (s *StateMachine) GetMembership() pb.Membership {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.members.get()
@@ -495,31 +539,34 @@ func (s *StateMachine) GetMembership() (map[uint64]string,
 // Concurrent returns a boolean flag indicating whether the state machine is
 // capable of taking concurrent snapshot.
 func (s *StateMachine) Concurrent() bool {
-	return s.sm.ConcurrentSnapshot()
+	return s.sm.Concurrent()
 }
 
 // OnDiskStateMachine returns a boolean flag indicating whether it is an on
 // disk state machine.
 func (s *StateMachine) OnDiskStateMachine() bool {
-	return s.onDiskSM
+	return s.onDiskSM && !s.isWitness
 }
 
-// SaveSnapshot creates a snapshot.
-func (s *StateMachine) SaveSnapshot(req SSRequest) (*pb.Snapshot,
+// Save creates a snapshot.
+func (s *StateMachine) Save(req SSRequest) (*pb.Snapshot,
 	*server.SSEnv, error) {
-	if req.IsStreamingSnapshot() {
+	if req.Streaming() {
 		panic("invalid snapshot request")
 	}
-	if s.Concurrent() {
-		return s.saveConcurrentSnapshot(req)
+	if s.isWitness {
+		plog.Panicf("witness %s saving snapshot", s.id())
 	}
-	return s.saveSnapshot(req)
+	if s.Concurrent() {
+		return s.concurrentSave(req)
+	}
+	return s.save(req)
 }
 
-// StreamSnapshot starts to stream snapshot from the current SM to a remote
-// node targeted by the provided sink.
-func (s *StateMachine) StreamSnapshot(sink pb.IChunkSink) error {
-	return s.streamSnapshot(sink)
+// Stream starts to stream snapshot from the current SM to a remote node
+// targeted by the provided sink.
+func (s *StateMachine) Stream(sink pb.IChunkSink) error {
+	return s.stream(sink)
 }
 
 // Sync synchronizes state machine's in-core state with that on disk.
@@ -556,9 +603,9 @@ func (s *StateMachine) Handle(batch []Task, apply []sm.Entry) (Task, error) {
 	defer func() {
 		// give the node worker a chance to run when
 		//  - batched applied value has been updated
-		//  - taskC has been poped
+		//  - taskC has been popped
 		if processed {
-			s.node.NodeReady()
+			s.node.StepReady()
 		}
 	}()
 	rec, ok := s.taskQ.Get()
@@ -600,13 +647,15 @@ func (s *StateMachine) Handle(batch []Task, apply []sm.Entry) (Task, error) {
 }
 
 func (s *StateMachine) isDummySnapshot(r SSRequest) bool {
-	if s.OnDiskStateMachine() {
-		if r.IsExportedSnapshot() || r.IsStreamingSnapshot() {
-			return false
-		}
-		return true
+	return s.OnDiskStateMachine() && !r.Exported() && !r.Streaming()
+}
+
+func (s *StateMachine) logMembership(name string,
+	index uint64, members map[uint64]string) {
+	plog.Infof("%d %s included in %s", len(members), name, s.ssid(index))
+	for nid, addr := range members {
+		plog.Infof("\t%s : %s", logutil.NodeID(nid), addr)
 	}
-	return false
 }
 
 func (s *StateMachine) getSSMeta(c interface{}, r SSRequest) (*SSMeta, error) {
@@ -627,19 +676,19 @@ func (s *StateMachine) getSSMeta(c interface{}, r SSRequest) (*SSMeta, error) {
 		OnDiskIndex:     s.onDiskIndex,
 		Request:         r,
 		Session:         buf,
-		Membership:      s.members.getMembership(),
-		Type:            s.sm.StateMachineType(),
+		Membership:      s.members.get(),
+		Type:            s.sm.Type(),
 		CompressionType: ct,
 	}
-	plog.Infof("%s generating a snapshot at index %d, members %v",
-		s.id(), meta.Index, meta.Membership.Addresses)
+	plog.Infof("%s generating %s", s.id(), s.ssid(meta.Index))
+	s.logMembership("members", meta.Index, meta.Membership.Addresses)
 	if err := s.sessions.SaveSessions(meta.Session); err != nil {
 		return nil, err
 	}
 	return meta, nil
 }
 
-func (s *StateMachine) updateLastApplied(index uint64, term uint64) {
+func (s *StateMachine) setLastApplied(index uint64, term uint64) {
 	if s.index+1 != index {
 		plog.Panicf("%s invalid index %d, applied %d", s.id(), index, s.index)
 	}
@@ -661,78 +710,77 @@ func (s *StateMachine) checkSnapshotStatus(req SSRequest) error {
 		panic("s.index < s.snapshotIndex")
 	}
 	if !s.OnDiskStateMachine() {
-		if !req.IsExportedSnapshot() &&
-			s.index > 0 && s.index == s.snapshotIndex {
+		if !req.Exported() && s.index > 0 && s.index == s.snapshotIndex {
 			return raft.ErrSnapshotOutOfDate
 		}
 	}
 	return nil
 }
 
-func (s *StateMachine) streamSnapshot(sink pb.IChunkSink) error {
+func (s *StateMachine) stream(sink pb.IChunkSink) error {
 	var err error
 	var meta *SSMeta
 	if err := func() error {
 		s.mu.RLock()
 		defer s.mu.RUnlock()
-		meta, err = s.prepareSnapshot(SSRequest{Type: StreamSnapshot})
+		meta, err = s.prepare(SSRequest{Type: Streaming})
 		return err
 	}(); err != nil {
 		return err
 	}
-	if tests.ReadyToReturnTestKnob(s.node.ShouldStop(), true, "snapshotter.Stream") {
+	if tests.ReadyToReturnTestKnob(s.node.ShouldStop(), "s.stream") {
 		return ErrTestKnobReturn
 	}
 	return s.snapshotter.Stream(s.sm, meta, sink)
 }
 
-func (s *StateMachine) saveConcurrentSnapshot(req SSRequest) (*pb.Snapshot,
+func (s *StateMachine) concurrentSave(req SSRequest) (*pb.Snapshot,
 	*server.SSEnv, error) {
 	var err error
 	var meta *SSMeta
 	if err := func() error {
 		s.mu.RLock()
 		defer s.mu.RUnlock()
-		meta, err = s.prepareSnapshot(req)
+		meta, err = s.prepare(req)
 		return err
 	}(); err != nil {
 		return nil, nil, err
 	}
-	if tests.ReadyToReturnTestKnob(s.node.ShouldStop(), true, "s.sync") {
+	if tests.ReadyToReturnTestKnob(s.node.ShouldStop(), "s.sync") {
 		return nil, nil, ErrTestKnobReturn
 	}
 	if err := s.sync(); err != nil {
 		return nil, nil, err
 	}
-	if tests.ReadyToReturnTestKnob(s.node.ShouldStop(), true, "s.doSaveSnapshot") {
+	if tests.ReadyToReturnTestKnob(s.node.ShouldStop(), "s.concurrentSave") {
 		return nil, nil, ErrTestKnobReturn
 	}
-	return s.doSaveSnapshot(meta)
+	return s.doSave(meta)
 }
 
-func (s *StateMachine) saveSnapshot(req SSRequest) (*pb.Snapshot,
+func (s *StateMachine) save(req SSRequest) (*pb.Snapshot,
 	*server.SSEnv, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	meta, err := s.prepareSnapshot(req)
+	meta, err := s.prepare(req)
 	if err != nil {
 		plog.Errorf("prepare snapshot failed %v", err)
 		return nil, nil, err
 	}
-	if tests.ReadyToReturnTestKnob(s.node.ShouldStop(), true, "s.doSaveSnapshot") {
+	if tests.ReadyToReturnTestKnob(s.node.ShouldStop(), "s.save") {
 		return nil, nil, ErrTestKnobReturn
 	}
-	return s.doSaveSnapshot(meta)
+	return s.doSave(meta)
 }
 
-func (s *StateMachine) prepareSnapshot(req SSRequest) (*SSMeta, error) {
+func (s *StateMachine) prepare(req SSRequest) (*SSMeta, error) {
 	if err := s.checkSnapshotStatus(req); err != nil {
 		return nil, err
 	}
 	var err error
 	var ctx interface{}
 	if s.Concurrent() {
-		ctx, err = s.sm.PrepareSnapshot()
+		ctx, err = s.sm.Prepare()
 		if err != nil {
 			return nil, err
 		}
@@ -754,7 +802,7 @@ func (s *StateMachine) sync() error {
 	return nil
 }
 
-func (s *StateMachine) doSaveSnapshot(meta *SSMeta) (*pb.Snapshot,
+func (s *StateMachine) doSave(meta *SSMeta) (*pb.Snapshot,
 	*server.SSEnv, error) {
 	snapshot, env, err := s.snapshotter.Save(s.sm, meta)
 	if err != nil {
@@ -832,56 +880,55 @@ func (s *StateMachine) updateOnDiskIndex(firstIndex uint64, lastIndex uint64) {
 	s.onDiskIndex = lastIndex
 }
 
-func (s *StateMachine) handleEntry(ent pb.Entry, last bool) error {
-	// ConfChnage also go through the SM so the index value is updated
-	if ent.IsConfigChange() {
-		accepted := s.handleConfigChange(ent)
-		s.node.ConfigChangeProcessed(ent.Key, accepted)
+func (s *StateMachine) handleEntry(e pb.Entry, last bool) error {
+	if e.IsConfigChange() {
+		accepted := s.handleConfigChange(e)
+		s.node.ConfigChangeProcessed(e.Key, accepted)
 	} else {
-		if !ent.IsSessionManaged() {
-			if ent.IsEmpty() {
-				s.handleNoOP(ent)
-				s.node.ApplyUpdate(ent, sm.Result{}, false, true, last)
+		if !e.IsSessionManaged() {
+			if e.IsEmpty() {
+				s.handleNoOP(e)
+				s.node.ApplyUpdate(e, sm.Result{}, false, true, last)
 			} else {
 				panic("not session managed, not empty")
 			}
 		} else {
-			if ent.IsNewSessionRequest() {
-				smResult := s.handleRegisterSession(ent)
-				s.node.ApplyUpdate(ent, smResult, isEmptyResult(smResult), false, last)
-			} else if ent.IsEndOfSessionRequest() {
-				smResult := s.handleUnregisterSession(ent)
-				s.node.ApplyUpdate(ent, smResult, isEmptyResult(smResult), false, last)
+			if e.IsNewSessionRequest() {
+				smResult := s.handleRegisterSession(e)
+				s.node.ApplyUpdate(e, smResult, isEmptyResult(smResult), false, last)
+			} else if e.IsEndOfSessionRequest() {
+				smResult := s.handleUnregisterSession(e)
+				s.node.ApplyUpdate(e, smResult, isEmptyResult(smResult), false, last)
 			} else {
-				if !s.entryInInitDiskSM(ent.Index) {
-					smResult, ignored, rejected, err := s.handleUpdate(ent)
+				if !s.entryInInitDiskSM(e.Index) {
+					smResult, ignored, rejected, err := s.handleUpdate(e)
 					if err != nil {
 						return err
 					}
 					if !ignored {
-						s.node.ApplyUpdate(ent, smResult, rejected, ignored, last)
+						s.node.ApplyUpdate(e, smResult, rejected, ignored, last)
 					}
 				} else {
 					// treat it as a NoOP entry
-					s.handleNoOP(pb.Entry{Index: ent.Index, Term: ent.Term})
+					s.handleNoOP(pb.Entry{Index: e.Index, Term: e.Term})
 				}
 			}
 		}
 	}
 	index := s.GetLastApplied()
-	if index != ent.Index {
-		plog.Panicf("unexpected last applied value, %d, %d", index, ent.Index)
+	if index != e.Index {
+		plog.Panicf("unexpected last applied value, %d, %d", index, e.Index)
 	}
 	if last {
-		s.setBatchedLastApplied(ent.Index)
+		s.setBatchedLastApplied(e.Index)
 	}
 	return nil
 }
 
-func (s *StateMachine) onUpdateApplied(ent pb.Entry,
+func (s *StateMachine) onUpdateApplied(e pb.Entry,
 	result sm.Result, ignored bool, rejected bool, last bool) {
 	if !ignored {
-		s.node.ApplyUpdate(ent, result, rejected, ignored, last)
+		s.node.ApplyUpdate(e, result, rejected, ignored, last)
 	}
 }
 
@@ -892,17 +939,17 @@ func (s *StateMachine) handleBatch(input []pb.Entry, ents []sm.Entry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	skipped := 0
-	for _, ent := range input {
-		if !s.entryInInitDiskSM(ent.Index) {
-			e := sm.Entry{
-				Index: ent.Index,
-				Cmd:   getEntryPayload(ent),
+	for _, e := range input {
+		if !s.entryInInitDiskSM(e.Index) {
+			rec := sm.Entry{
+				Index: e.Index,
+				Cmd:   getEntryPayload(e),
 			}
-			ents = append(ents, e)
+			ents = append(ents, rec)
 		} else {
 			skipped++
 		}
-		s.updateLastApplied(ent.Index, ent.Term)
+		s.setLastApplied(e.Index, e.Term)
 	}
 	if len(ents) > 0 {
 		firstIndex := ents[0].Index
@@ -912,15 +959,15 @@ func (s *StateMachine) handleBatch(input []pb.Entry, ents []sm.Entry) error {
 		if err != nil {
 			return err
 		}
-		for idx, ent := range results {
+		for idx, e := range results {
 			ce := input[skipped+idx]
-			if ce.Index != ent.Index {
+			if ce.Index != e.Index {
 				// probably because user modified the Index value in results
 				plog.Panicf("%s alignment error, %d, %d, %d",
-					s.id(), ce.Index, ent.Index, skipped)
+					s.id(), ce.Index, e.Index, skipped)
 			}
 			last := ce.Index == input[len(input)-1].Index
-			s.onUpdateApplied(ce, ent.Result, false, false, last)
+			s.onUpdateApplied(ce, e.Result, false, false, last)
 		}
 	}
 	if len(input) > 0 {
@@ -929,9 +976,9 @@ func (s *StateMachine) handleBatch(input []pb.Entry, ents []sm.Entry) error {
 	return nil
 }
 
-func (s *StateMachine) handleConfigChange(ent pb.Entry) bool {
+func (s *StateMachine) handleConfigChange(e pb.Entry) bool {
 	var cc pb.ConfigChange
-	if err := cc.Unmarshal(ent.Cmd); err != nil {
+	if err := cc.Unmarshal(e.Cmd); err != nil {
 		panic(err)
 	}
 	if cc.Type == pb.AddNode && len(cc.Address) == 0 {
@@ -939,60 +986,60 @@ func (s *StateMachine) handleConfigChange(ent pb.Entry) bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.updateLastApplied(ent.Index, ent.Term)
-	if s.members.handleConfigChange(cc, ent.Index) {
+	s.setLastApplied(e.Index, e.Term)
+	if s.members.handleConfigChange(cc, e.Index) {
 		s.node.ApplyConfigChange(cc)
 		return true
 	}
 	return false
 }
 
-func (s *StateMachine) handleRegisterSession(ent pb.Entry) sm.Result {
+func (s *StateMachine) handleRegisterSession(e pb.Entry) sm.Result {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	smResult := s.sessions.RegisterClientID(ent.ClientID)
+	smResult := s.sessions.RegisterClientID(e.ClientID)
 	if isEmptyResult(smResult) {
-		plog.Errorf("%s register client failed %v", s.id(), ent)
+		plog.Errorf("%s register client failed %v", s.id(), e)
 	}
-	s.updateLastApplied(ent.Index, ent.Term)
+	s.setLastApplied(e.Index, e.Term)
 	return smResult
 }
 
-func (s *StateMachine) handleUnregisterSession(ent pb.Entry) sm.Result {
+func (s *StateMachine) handleUnregisterSession(e pb.Entry) sm.Result {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	smResult := s.sessions.UnregisterClientID(ent.ClientID)
+	smResult := s.sessions.UnregisterClientID(e.ClientID)
 	if isEmptyResult(smResult) {
-		plog.Errorf("%s unregister %d failed %v", s.id(), ent.ClientID, ent)
+		plog.Errorf("%s unregister %d failed %v", s.id(), e.ClientID, e)
 	}
-	s.updateLastApplied(ent.Index, ent.Term)
+	s.setLastApplied(e.Index, e.Term)
 	return smResult
 }
 
-func (s *StateMachine) handleNoOP(ent pb.Entry) {
+func (s *StateMachine) handleNoOP(e pb.Entry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !ent.IsEmpty() || ent.IsSessionManaged() {
+	if !e.IsEmpty() || e.IsSessionManaged() {
 		panic("handle empty event called on non-empty event")
 	}
-	s.updateLastApplied(ent.Index, ent.Term)
+	s.setLastApplied(e.Index, e.Term)
 }
 
 // result a tuple of (result, should ignore, rejected)
-func (s *StateMachine) handleUpdate(ent pb.Entry) (sm.Result, bool, bool, error) {
+func (s *StateMachine) handleUpdate(e pb.Entry) (sm.Result, bool, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var ok bool
 	var session *Session
-	s.updateLastApplied(ent.Index, ent.Term)
-	if !ent.IsNoOPSession() {
-		session, ok = s.sessions.ClientRegistered(ent.ClientID)
+	s.setLastApplied(e.Index, e.Term)
+	if !e.IsNoOPSession() {
+		session, ok = s.sessions.ClientRegistered(e.ClientID)
 		if !ok {
 			// client is expected to crash
 			return sm.Result{}, false, true, nil
 		}
-		s.sessions.UpdateRespondedTo(session, ent.RespondedTo)
-		v, responded, toUpdate := s.sessions.UpdateRequired(session, ent.SeriesID)
+		s.sessions.UpdateRespondedTo(session, e.RespondedTo)
+		v, responded, toUpdate := s.sessions.UpdateRequired(session, e.SeriesID)
 		if responded {
 			// should ignore. client is expected to timeout
 			return sm.Result{}, true, false, nil
@@ -1004,22 +1051,22 @@ func (s *StateMachine) handleUpdate(ent pb.Entry) (sm.Result, bool, bool, error)
 			return v, false, false, nil
 		}
 	}
-	if !ent.IsNoOPSession() && session == nil {
+	if !e.IsNoOPSession() && session == nil {
 		panic("session not found")
 	}
 	if session != nil {
-		if _, ok := session.getResponse(RaftSeriesID(ent.SeriesID)); ok {
+		if _, ok := session.getResponse(RaftSeriesID(e.SeriesID)); ok {
 			panic("already has response in session")
 		}
 	}
-	s.updateOnDiskIndex(ent.Index, ent.Index)
-	cmd := getEntryPayload(ent)
-	result, err := s.sm.Update(sm.Entry{Index: ent.Index, Cmd: cmd})
+	s.updateOnDiskIndex(e.Index, e.Index)
+	cmd := getEntryPayload(e)
+	result, err := s.sm.Update(sm.Entry{Index: e.Index, Cmd: cmd})
 	if err != nil {
 		return sm.Result{}, false, false, err
 	}
 	if session != nil {
-		session.addResponse(RaftSeriesID(ent.SeriesID), result)
+		session.addResponse(RaftSeriesID(e.SeriesID), result)
 	}
 	return result, false, false, nil
 }
@@ -1028,20 +1075,6 @@ func (s *StateMachine) id() string {
 	return logutil.DescribeSM(s.node.ClusterID(), s.node.NodeID())
 }
 
-func snapshotInfo(ss pb.Snapshot) string {
-	return fmt.Sprintf("addresses %v, config change id %d",
-		ss.Membership.Addresses, ss.Membership.ConfigChangeId)
-}
-
-func getSnapshotFiles(snapshot pb.Snapshot) []sm.SnapshotFile {
-	sfl := make([]sm.SnapshotFile, 0)
-	for _, f := range snapshot.Files {
-		sf := sm.SnapshotFile{
-			FileID:   f.FileId,
-			Filepath: f.Filepath,
-			Metadata: f.Metadata,
-		}
-		sfl = append(sfl, sf)
-	}
-	return sfl
+func (s *StateMachine) ssid(index uint64) string {
+	return logutil.DescribeSS(s.node.ClusterID(), s.node.NodeID(), index)
 }

@@ -21,8 +21,8 @@ import (
 )
 
 var (
-	initialTaskQueueCap uint64 = settings.Soft.TaskQueueInitialCap
-	taskQueueBusyCap    uint64 = settings.Soft.TaskQueueTargetLength
+	initialTaskQueueCap        = settings.Soft.TaskQueueInitialCap
+	taskQueueBusyCap           = settings.Soft.TaskQueueTargetLength
 	snapshotTaskCSlots  uint64 = 4
 	emptyTask                  = Task{}
 )
@@ -56,6 +56,16 @@ func (tq *TaskQueue) Add(task Task) {
 	tq.mu.Lock()
 	tq.tasks = append(tq.tasks, task)
 	tq.mu.Unlock()
+}
+
+// GetAll returns all tasks currently in the queue.
+func (tq *TaskQueue) GetAll() []Task {
+	tq.mu.Lock()
+	defer tq.mu.Unlock()
+	result := tq.tasks
+	tq.tasks = make([]Task, 0, initialTaskQueueCap)
+	tq.next = 0
+	return result
 }
 
 // Get returns a task from the queue if there is any.
